@@ -5,6 +5,8 @@
 #include "sys/syscall.h"
 #include "sys/io_uring.h"
 #include "mem/string.h"
+#include "mqtt/packet.h"
+#include "mqtt/connect.h"
 
 // =============================================================================
 // Configuration
@@ -13,6 +15,8 @@
 #define LISTEN_PORT    1883
 #define LISTEN_BACKLOG 128
 #define RING_ENTRIES   256
+#define MAX_CONNS      1024
+#define RECV_BUF_SIZE  4096 // Per-connection receive buffer
 
 // =============================================================================
 // Simple output (writes to stderr)
@@ -91,6 +95,34 @@ INLINE u32 ud_ctx(u64 ud) {
 }
 
 // =============================================================================
+// Connection State
+// =============================================================================
+
+enum conn_state {
+    CONN_FREE = 0,  // Slot available
+    CONN_ACCEPTED,  // TCP connected, awaiting CONNECT packet
+    CONN_CONNECTED, // MQTT connected, normal operation
+    CONN_CLOSING,   // Close in progress
+};
+
+struct connection {
+    enum conn_state state;
+    i32 fd;
+
+    // Receive buffer (owned by connection)
+    u8 recv_buf[RECV_BUF_SIZE];
+    u32 recv_len; // Data in buffer
+
+    // MQTT session state
+    u16 keepalive; // Keepalive interval (seconds, 0=disabled)
+    bool clean_session;
+
+    // Client ID (points into recv_buf during CONNECT, copied after)
+    char client_id[64];
+    u8 client_id_len;
+};
+
+// =============================================================================
 // Broker state
 // =============================================================================
 
@@ -99,11 +131,44 @@ struct broker {
     i32 listen_fd;
     volatile bool running;
 
+    // Connection table (indexed by fd for O(1) lookup)
+    struct connection conns[MAX_CONNS];
+
     // Stats
     u64 accepts;
     u64 bytes_recv;
     u64 bytes_sent;
 };
+
+// =============================================================================
+// Connection Management
+// =============================================================================
+
+static struct connection *conn_get(struct broker *b, i32 fd) {
+    if (fd < 0 || fd >= MAX_CONNS) {
+        return NULL;
+    }
+    return &b->conns[fd];
+}
+
+static struct connection *conn_alloc(struct broker *b, i32 fd) {
+    struct connection *c = conn_get(b, fd);
+    if (!c) {
+        return NULL;
+    }
+    memset(c, 0, sizeof(*c));
+    c->fd    = fd;
+    c->state = CONN_ACCEPTED;
+    return c;
+}
+
+static void conn_free(struct broker *b, i32 fd) {
+    struct connection *c = conn_get(b, fd);
+    if (c) {
+        c->state = CONN_FREE;
+        c->fd    = -1;
+    }
+}
 
 // =============================================================================
 // Socket setup
@@ -183,6 +248,46 @@ static void submit_accept(struct broker *b) {
     ring_submit_sqe(&b->ring);
 }
 
+static void submit_recv(struct broker *b, struct connection *c) {
+    struct io_uring_sqe *sqe = ring_get_sqe(&b->ring);
+    if (!sqe) {
+        println("SQ full, can't submit recv");
+        return;
+    }
+
+    // Receive into buffer at current position
+    u8 *buf   = c->recv_buf + c->recv_len;
+    u32 space = RECV_BUF_SIZE - c->recv_len;
+
+    ring_prep_recv(sqe, c->fd, buf, space, 0);
+    sqe->user_data = make_user_data(OP_RECV, (u32)c->fd, 0);
+    ring_submit_sqe(&b->ring);
+}
+
+static void submit_send(struct broker *b, i32 fd, const u8 *buf, u32 len) {
+    struct io_uring_sqe *sqe = ring_get_sqe(&b->ring);
+    if (!sqe) {
+        println("SQ full, can't submit send");
+        return;
+    }
+
+    ring_prep_send(sqe, fd, buf, len, 0);
+    sqe->user_data = make_user_data(OP_SEND, (u32)fd, 0);
+    ring_submit_sqe(&b->ring);
+}
+
+static void submit_close(struct broker *b, i32 fd) {
+    struct io_uring_sqe *sqe = ring_get_sqe(&b->ring);
+    if (!sqe) {
+        println("SQ full, can't submit close");
+        return;
+    }
+
+    ring_prep_close(sqe, fd);
+    sqe->user_data = make_user_data(OP_CLOSE, (u32)fd, 0);
+    ring_submit_sqe(&b->ring);
+}
+
 static void handle_accept(struct broker *b, struct io_uring_cqe *cqe) {
     i32 client_fd = cqe->res;
 
@@ -190,38 +295,249 @@ static void handle_accept(struct broker *b, struct io_uring_cqe *cqe) {
         print("accept() failed: ");
         print_num(client_fd);
         println("");
-        // Re-arm accept
+        submit_accept(b);
+        return;
+    }
+
+    // Check fd is in range
+    if (client_fd >= MAX_CONNS) {
+        print("fd too large: ");
+        print_num(client_fd);
+        println("");
+        sys_close(client_fd);
         submit_accept(b);
         return;
     }
 
     b->accepts++;
-    print("Accepted connection fd=");
+
+    // Allocate connection state
+    struct connection *c = conn_alloc(b, client_fd);
+    if (!c) {
+        sys_close(client_fd);
+        submit_accept(b);
+        return;
+    }
+
+    print("Accepted fd=");
     print_num(client_fd);
     println("");
 
-    // For now, just close immediately (placeholder for connection handling)
-    struct io_uring_sqe *sqe = ring_get_sqe(&b->ring);
-    if (sqe) {
-        ring_prep_close(sqe, client_fd);
-        sqe->user_data = make_user_data(OP_CLOSE, (u32)client_fd, 0);
-        ring_submit_sqe(&b->ring);
-    }
+    // Start receiving MQTT CONNECT packet
+    submit_recv(b, c);
 
     // Re-arm accept
     submit_accept(b);
 }
 
-static void handle_close(struct broker *b, struct io_uring_cqe *cqe) {
+// =============================================================================
+// MQTT Packet Processing
+// =============================================================================
+
+// Process a complete MQTT packet
+// Returns: bytes consumed, or -1 on error (close connection)
+static i32 process_mqtt_packet(struct broker *b, struct connection *c, const u8 *buf, u32 len) {
+    struct mqtt_fixed_header hdr;
+    i32 hdr_len = mqtt_parse_fixed_header(buf, len, &hdr);
+    if (hdr_len < 0) {
+        return hdr_len;
+    }
+
+    u32 total_len = (u32)hdr_len + hdr.remaining_len;
+
+    // Variable header starts after fixed header
+    const u8 *var_hdr = buf + hdr_len;
+    u32 var_len       = hdr.remaining_len;
+
+    switch (hdr.type) {
+    case MQTT_CONNECT: {
+        if (c->state != CONN_ACCEPTED) {
+            // Protocol error: CONNECT must be first packet
+            return -1;
+        }
+
+        struct mqtt_connect conn_pkt;
+        i32 rc = mqtt_parse_connect(var_hdr, var_len, &conn_pkt);
+        if (rc < 0) {
+            // Send CONNACK with error
+            u8 connack[MQTT_CONNACK_SIZE];
+            u8 reason =
+                (rc == MQTT_ERR_PROTOCOL) ? MQTT_CONNACK_PROTO_VERSION : MQTT_CONNACK_ID_REJECTED;
+            mqtt_encode_connack(connack, false, reason);
+            submit_send(b, c->fd, connack, MQTT_CONNACK_SIZE);
+            return -1; // Close after send
+        }
+
+        // Store session info
+        c->keepalive     = conn_pkt.keepalive;
+        c->clean_session = conn_pkt.clean_session;
+
+        // Copy client ID (it points into recv buffer which will be reused)
+        u8 id_len = conn_pkt.client_id.len;
+        if (id_len > sizeof(c->client_id) - 1) {
+            id_len = sizeof(c->client_id) - 1;
+        }
+        memcpy(c->client_id, conn_pkt.client_id.ptr, id_len);
+        c->client_id[id_len] = '\0';
+        c->client_id_len     = id_len;
+
+        c->state = CONN_CONNECTED;
+
+        print("CONNECT from '");
+        sys_write(2, c->client_id, c->client_id_len);
+        print("' keepalive=");
+        print_num(c->keepalive);
+        println("");
+
+        // Send CONNACK success
+        u8 connack[MQTT_CONNACK_SIZE];
+        mqtt_encode_connack(connack, false, MQTT_CONNACK_ACCEPTED);
+        submit_send(b, c->fd, connack, MQTT_CONNACK_SIZE);
+        break;
+    }
+
+    case MQTT_PINGREQ: {
+        if (c->state != CONN_CONNECTED) {
+            return -1;
+        }
+        // Send PINGRESP (2 bytes: type + remaining length 0)
+        u8 pingresp[2] = {MQTT_PINGRESP << 4, 0};
+        submit_send(b, c->fd, pingresp, 2);
+        break;
+    }
+
+    case MQTT_DISCONNECT: {
+        // Clean disconnect
+        print("DISCONNECT from fd=");
+        print_num(c->fd);
+        println("");
+        return -1; // Signal to close
+    }
+
+    case MQTT_PUBLISH:
+    case MQTT_SUBSCRIBE:
+    case MQTT_UNSUBSCRIBE:
+        // Not yet implemented
+        print("Unhandled packet type: ");
+        print_num(hdr.type);
+        println("");
+        break;
+
+    default:
+        print("Unknown packet type: ");
+        print_num(hdr.type);
+        println("");
+        return -1;
+    }
+
+    return (i32)total_len;
+}
+
+// Process all complete packets in connection's receive buffer
+static void process_recv_buffer(struct broker *b, struct connection *c) {
+    while (c->recv_len > 0) {
+        i32 packet_len = mqtt_packet_complete(c->recv_buf, c->recv_len);
+
+        if (packet_len == MQTT_INCOMPLETE) {
+            // Need more data
+            break;
+        }
+
+        if (packet_len < 0) {
+            // Malformed packet - close connection
+            print("Malformed packet from fd=");
+            print_num(c->fd);
+            println("");
+            c->state = CONN_CLOSING;
+            submit_close(b, c->fd);
+            return;
+        }
+
+        // Process the complete packet
+        i32 consumed = process_mqtt_packet(b, c, c->recv_buf, (u32)packet_len);
+
+        if (consumed < 0) {
+            // Error or disconnect - close connection
+            c->state = CONN_CLOSING;
+            submit_close(b, c->fd);
+            return;
+        }
+
+        // Remove processed bytes from buffer
+        u32 remaining = c->recv_len - (u32)consumed;
+        if (remaining > 0) {
+            memmove(c->recv_buf, c->recv_buf + consumed, remaining);
+        }
+        c->recv_len = remaining;
+    }
+}
+
+// =============================================================================
+// CQE Handlers
+// =============================================================================
+
+static void handle_recv(struct broker *b, struct io_uring_cqe *cqe) {
+    i32 fd               = (i32)ud_fd(cqe->user_data);
+    struct connection *c = conn_get(b, fd);
+
+    if (!c || c->state == CONN_FREE || c->state == CONN_CLOSING) {
+        return;
+    }
+
+    if (cqe->res <= 0) {
+        // Error or EOF
+        if (cqe->res < 0) {
+            print("recv error fd=");
+            print_num(fd);
+            print(" err=");
+            print_num(cqe->res);
+            println("");
+        }
+        c->state = CONN_CLOSING;
+        submit_close(b, fd);
+        return;
+    }
+
+    // Update buffer length
+    c->recv_len += (u32)cqe->res;
+    b->bytes_recv += (u64)cqe->res;
+
+    // Process complete packets
+    process_recv_buffer(b, c);
+
+    // If still connected, submit another recv
+    if (c->state == CONN_ACCEPTED || c->state == CONN_CONNECTED) {
+        submit_recv(b, c);
+    }
+}
+
+static void handle_send(struct broker *b, struct io_uring_cqe *cqe) {
+    i32 fd = (i32)ud_fd(cqe->user_data);
     (void)b;
-    u32 fd = ud_fd(cqe->user_data);
+
     if (cqe->res < 0) {
-        print("close(fd=");
+        print("send error fd=");
         print_num(fd);
-        print(") failed: ");
+        print(" err=");
+        print_num(cqe->res);
+        println("");
+    } else {
+        b->bytes_sent += (u64)cqe->res;
+    }
+}
+
+static void handle_close(struct broker *b, struct io_uring_cqe *cqe) {
+    i32 fd = (i32)ud_fd(cqe->user_data);
+
+    if (cqe->res < 0) {
+        print("close error fd=");
+        print_num(fd);
+        print(" err=");
         print_num(cqe->res);
         println("");
     }
+
+    conn_free(b, fd);
 }
 
 static void dispatch_cqe(struct broker *b, struct io_uring_cqe *cqe) {
@@ -231,12 +547,14 @@ static void dispatch_cqe(struct broker *b, struct io_uring_cqe *cqe) {
     case OP_ACCEPT:
         handle_accept(b, cqe);
         break;
+    case OP_RECV:
+        handle_recv(b, cqe);
+        break;
+    case OP_SEND:
+        handle_send(b, cqe);
+        break;
     case OP_CLOSE:
         handle_close(b, cqe);
-        break;
-    case OP_RECV:
-    case OP_SEND:
-        // TODO: implement
         break;
     default:
         print("Unknown op: ");

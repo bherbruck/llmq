@@ -5,8 +5,6 @@
 
 # IDE/editor caches
 /.cache/
-/.vscode/
-/.idea/
 *.swp
 *~
 
