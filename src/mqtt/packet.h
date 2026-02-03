@@ -80,6 +80,64 @@ struct mqtt_str {
 };
 
 // =============================================================================
+// Topic Segment Iterator
+// =============================================================================
+
+// Iterates over '/'-delimited segments in a topic string
+// Usage:
+//   struct topic_iter it = topic_iter_init(topic, len);
+//   struct mqtt_str seg;
+//   while (topic_iter_next(&it, &seg)) {
+//       // use seg.ptr, seg.len
+//   }
+
+struct topic_iter {
+    const u8 *data;
+    u16 len;
+    u16 pos;
+};
+
+INLINE struct topic_iter topic_iter_init(const u8 *data, u16 len) {
+    return (struct topic_iter){.data = data, .len = len, .pos = 0};
+}
+
+// Returns true if segment found, false if exhausted
+INLINE bool topic_iter_next(struct topic_iter *it, struct mqtt_str *seg) {
+    if (it->pos >= it->len) {
+        return false;
+    }
+
+    u16 start = it->pos;
+    while (it->pos < it->len && it->data[it->pos] != '/') {
+        it->pos++;
+    }
+
+    seg->ptr = it->data + start;
+    seg->len = it->pos - start;
+
+    // Skip delimiter
+    if (it->pos < it->len) {
+        it->pos++;
+    }
+
+    return true;
+}
+
+// Extract segment at position, return next position (for recursive use)
+INLINE u16 topic_extract_segment(const u8 *data, u16 len, u16 pos, struct mqtt_str *seg) {
+    u16 start = pos;
+    while (pos < len && data[pos] != '/') {
+        pos++;
+    }
+
+    seg->ptr = data + start;
+    seg->len = pos - start;
+
+    // Return position after delimiter
+    return (pos < len) ? pos + 1 : pos;
+}
+
+// =============================================================================
 // Fixed Header
 // =============================================================================
 

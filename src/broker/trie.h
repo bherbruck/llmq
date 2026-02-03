@@ -6,6 +6,7 @@
 
 #include "sys/types.h"
 #include "mem/string.h"
+#include "mqtt/packet.h"
 #include "config.h"
 
 // =============================================================================
@@ -157,29 +158,16 @@ INLINE i32 trie_subscribe(struct topic_trie *t, const u8 *filter, u16 len, u32 f
         return -1; // fd out of range
     }
 
-    u32 node_idx = 0; // Start at root
-    u16 pos      = 0;
+    u32 node_idx         = 0; // Start at root
+    struct topic_iter it = topic_iter_init(filter, len);
+    struct mqtt_str seg;
 
-    while (pos < len) {
-        // Extract segment
-        u16 seg_start = pos;
-        while (pos < len && filter[pos] != '/') {
-            pos++;
-        }
-        u16 seg_len       = pos - seg_start;
-        const u8 *segment = filter + seg_start;
-
-        // Skip separator
-        if (pos < len)
-            pos++;
-
+    while (topic_iter_next(&it, &seg)) {
         // Limit segment length
-        if (seg_len > TRIE_MAX_SEGMENT) {
-            seg_len = TRIE_MAX_SEGMENT;
-        }
+        u8 seg_len = (seg.len > TRIE_MAX_SEGMENT) ? TRIE_MAX_SEGMENT : (u8)seg.len;
 
         // Find or create child
-        u32 child_idx = trie_find_child(t, node_idx, segment, (u8)seg_len);
+        u32 child_idx = trie_find_child(t, node_idx, seg.ptr, seg_len);
 
         if (child_idx == 0) {
             // Create new child
@@ -189,13 +177,13 @@ INLINE i32 trie_subscribe(struct topic_trie *t, const u8 *filter, u16 len, u32 f
             }
 
             struct trie_node *child = &t->nodes[child_idx];
-            child->name_len         = (u8)seg_len;
-            memcpy(child->name, segment, seg_len);
+            child->name_len         = seg_len;
+            memcpy(child->name, seg.ptr, seg_len);
 
             // Check wildcards
-            if (seg_len == 1 && segment[0] == '+') {
+            if (seg_len == 1 && seg.ptr[0] == '+') {
                 child->is_plus = 1;
-            } else if (seg_len == 1 && segment[0] == '#') {
+            } else if (seg_len == 1 && seg.ptr[0] == '#') {
                 child->is_hash = 1;
             }
 
@@ -230,29 +218,16 @@ INLINE i32 trie_unsubscribe(struct topic_trie *t, const u8 *filter, u16 len, u32
         return -1;
     }
 
-    u32 node_idx = 0;
-    u16 pos      = 0;
+    u32 node_idx         = 0;
+    struct topic_iter it = topic_iter_init(filter, len);
+    struct mqtt_str seg;
 
-    while (pos < len) {
-        u16 seg_start = pos;
-        while (pos < len && filter[pos] != '/') {
-            pos++;
-        }
-        u16 seg_len       = pos - seg_start;
-        const u8 *segment = filter + seg_start;
-
-        if (pos < len)
-            pos++;
-
-        if (seg_len > TRIE_MAX_SEGMENT) {
-            seg_len = TRIE_MAX_SEGMENT;
-        }
-
-        u32 child_idx = trie_find_child(t, node_idx, segment, (u8)seg_len);
+    while (topic_iter_next(&it, &seg)) {
+        u8 seg_len    = (seg.len > TRIE_MAX_SEGMENT) ? TRIE_MAX_SEGMENT : (u8)seg.len;
+        u32 child_idx = trie_find_child(t, node_idx, seg.ptr, seg_len);
         if (child_idx == 0) {
             return -1; // Not found
         }
-
         node_idx = child_idx;
     }
 
@@ -323,17 +298,8 @@ static void trie_match_recursive(struct topic_trie *t, u32 node_idx, const u8 *t
     }
 
     // Extract current segment
-    u16 seg_start = pos;
-    while (pos < len && topic[pos] != '/') {
-        pos++;
-    }
-    u16 seg_len       = pos - seg_start;
-    const u8 *segment = topic + seg_start;
-
-    // Skip separator
-    u16 next_pos = pos;
-    if (next_pos < len)
-        next_pos++;
+    struct mqtt_str seg;
+    u16 next_pos = topic_extract_segment(topic, len, pos, &seg);
 
     // Check '+' wildcard child (matches this segment)
     u32 plus_child = trie_find_plus(t, node_idx);
@@ -342,8 +308,8 @@ static void trie_match_recursive(struct topic_trie *t, u32 node_idx, const u8 *t
     }
 
     // Check exact match child
-    if (seg_len <= TRIE_MAX_SEGMENT) {
-        u32 exact_child = trie_find_child(t, node_idx, segment, (u8)seg_len);
+    if (seg.len <= TRIE_MAX_SEGMENT) {
+        u32 exact_child = trie_find_child(t, node_idx, seg.ptr, (u8)seg.len);
         if (exact_child != 0) {
             trie_match_recursive(t, exact_child, topic, next_pos, len, cb, ctx);
         }
