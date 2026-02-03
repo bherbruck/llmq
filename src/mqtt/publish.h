@@ -163,6 +163,52 @@ INLINE u32 mqtt_encode_publish(u8 *buf, const struct mqtt_publish *pub, u16 pack
 }
 
 // =============================================================================
+// PUBLISH Scatter-Gather Encoding (for QoS 1/2 zero-copy fan-out)
+// =============================================================================
+
+// Encode PUBLISH packet in scatter-gather format for QoS 1/2
+// Layout: [header][remaining_len][topic_len][topic][payload]
+// The packet_id will be inserted via writev between topic and payload
+// Returns: topic_end offset (where to split for iovec)
+// out_total is set to total length (header + topic + payload, WITHOUT packet_id)
+INLINE u32 mqtt_encode_publish_scatter(u8 *buf, const struct mqtt_publish *pub, u32 *out_total,
+                                       u32 *out_payload_len) {
+    // Fixed header flags
+    u8 flags = 0;
+    if (pub->retain)
+        flags |= MQTT_PUBLISH_FLAG_RETAIN;
+    // Always encode as QoS 1 for scatter-gather (packet_id will be inserted)
+    flags |= (1 << MQTT_PUBLISH_FLAG_QOS_SHIFT) & MQTT_PUBLISH_FLAG_QOS_MASK;
+    if (pub->dup)
+        flags |= MQTT_PUBLISH_FLAG_DUP;
+
+    // Remaining length INCLUDES packet_id (2 bytes) even though we don't encode it here
+    u32 remaining = 2 + pub->topic.len + 2 + pub->payload_len;
+
+    // Fixed header
+    u32 pos = mqtt_encode_fixed_header(buf, MQTT_PUBLISH, flags, remaining);
+
+    // Topic
+    buf[pos++] = (u8)(pub->topic.len >> MQTT_U16_HIGH_SHIFT);
+    buf[pos++] = (u8)(pub->topic.len & MQTT_U16_LOW_MASK);
+    for (u16 i = 0; i < pub->topic.len; i++) {
+        buf[pos++] = pub->topic.ptr[i];
+    }
+
+    // Record topic_end (this is where packet_id would be inserted)
+    u32 topic_end = pos;
+
+    // Payload (follows directly, packet_id will be inserted via writev)
+    for (u32 i = 0; i < pub->payload_len; i++) {
+        buf[pos++] = pub->payload[i];
+    }
+
+    *out_total       = pos;
+    *out_payload_len = pub->payload_len;
+    return topic_end;
+}
+
+// =============================================================================
 // PUBACK Encoding (QoS 1 acknowledgment)
 // =============================================================================
 

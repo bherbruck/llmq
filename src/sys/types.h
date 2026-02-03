@@ -67,4 +67,13 @@ STATIC_ASSERT(sizeof(u32) == 4, "u32 must be 4 bytes");
 STATIC_ASSERT(sizeof(u64) == 8, "u64 must be 8 bytes");
 STATIC_ASSERT(sizeof(void *) == 8, "pointers must be 8 bytes");
 
+// =============================================================================
+// I/O vector for scatter-gather I/O
+// =============================================================================
+
+struct iovec {
+    void *iov_base;
+    usize iov_len;
+};
+
 #endif // SYS_TYPES_H

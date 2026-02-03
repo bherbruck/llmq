@@ -92,6 +92,19 @@ INLINE void submit_send_shared(struct broker *b, i32 fd, const u8 *buf, u32 len,
     ring_submit_sqe(&b->ring);
 }
 
+// Submit scatter-gather send for QoS 1/2 (3 iovecs: header+topic, packet_id, payload)
+// Context encodes slot_idx + inflight_idx + qos for ACK handling
+INLINE void submit_send_writev(struct broker *b, i32 fd, struct iovec *iov, u32 ctx) {
+    struct io_uring_sqe *sqe = get_sqe_with_flush(b);
+    if (!sqe) {
+        log_error("SQ full, can't submit writev");
+        return;
+    }
+    ring_prep_writev(sqe, fd, iov, 3, 0);
+    sqe->user_data = make_user_data(OP_SEND_WRITEV, (u32)fd, ctx);
+    ring_submit_sqe(&b->ring);
+}
+
 INLINE void submit_close(struct broker *b, i32 fd) {
     struct io_uring_sqe *sqe = get_sqe_with_flush(b);
     if (!sqe) {
@@ -213,8 +226,7 @@ INLINE void handle_recv(struct broker *b, struct io_uring_cqe *cqe) {
 }
 
 INLINE void handle_send(struct broker *b, struct io_uring_cqe *cqe) {
-    i32 fd  = (i32)ud_fd(cqe->user_data);
-    u32 ctx = ud_ctx(cqe->user_data);
+    i32 fd = (i32)ud_fd(cqe->user_data);
 
     if (cqe->res < 0) {
         log_debug("send error fd=%d err=%d", fd, cqe->res);
@@ -226,23 +238,36 @@ INLINE void handle_send(struct broker *b, struct io_uring_cqe *cqe) {
     } else {
         b->bytes_sent += (u64)cqe->res;
     }
+}
 
-    // Free inflight buffer for QoS 0 sends (QoS 1/2 wait for ACK)
-    if (ctx != 0) {
+// Handle completion of scatter-gather send (QoS 1/2 zero-copy fan-out)
+INLINE void handle_send_writev(struct broker *b, struct io_uring_cqe *cqe) {
+    i32 fd  = (i32)ud_fd(cqe->user_data);
+    u32 ctx = ud_ctx(cqe->user_data);
+
+    if (cqe->res < 0) {
+        log_debug("writev error fd=%d err=%d", fd, cqe->res);
+        // Connection broken - close it
+        struct client_slot *c = broker_get_client_by_fd(b, fd);
+        if (c && c->state == CLIENT_ACTIVE) {
+            submit_close(b, fd);
+        }
+    } else {
+        b->bytes_sent += (u64)cqe->res;
+    }
+
+    // For send errors, free the inflight entry (message won't be delivered)
+    if (cqe->res < 0) {
         u32 slot_idx    = send_ctx_slot(ctx);
         u8 inflight_idx = send_ctx_inflight(ctx);
-        u8 qos          = send_ctx_qos(ctx);
 
         struct client_slot *c = broker_get_client(b, slot_idx);
         if (c && inflight_idx < c->max_inflight) {
             struct inflight_msg *inf = &c->inflight[inflight_idx];
-            // QoS 0: Free immediately on send complete
-            // QoS 1/2: Buffer stays until PUBACK/PUBCOMP (or send error)
-            if (qos == 0 || cqe->res < 0) {
-                client_inflight_free(c, inf, &b->send_pool);
-            }
+            client_inflight_free(c, inf, &b->msg_pool);
         }
     }
+    // On success, keep inflight entry until PUBACK/PUBCOMP
 }
 
 // Handle completion of shared buffer send (QoS 0 zero-copy fan-out)
@@ -291,6 +316,9 @@ INLINE void dispatch_cqe(struct broker *b, struct io_uring_cqe *cqe) {
         break;
     case OP_SEND_SHARED:
         handle_send_shared(b, cqe);
+        break;
+    case OP_SEND_WRITEV:
+        handle_send_writev(b, cqe);
         break;
     case OP_CLOSE:
         handle_close(b, cqe);

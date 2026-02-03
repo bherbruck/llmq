@@ -348,6 +348,15 @@ INLINE void ring_prep_send_zc(struct io_uring_sqe *sqe, i32 fd, const void *buf,
     sqe->msg_flags = flags;
 }
 
+INLINE void ring_prep_writev(struct io_uring_sqe *sqe, i32 fd, const struct iovec *iov, u32 nr_vecs,
+                             u32 flags) {
+    sqe->opcode    = IORING_OP_WRITEV;
+    sqe->fd        = fd;
+    sqe->addr      = (u64)iov;
+    sqe->len       = nr_vecs;
+    sqe->msg_flags = flags;
+}
+
 INLINE void ring_prep_close(struct io_uring_sqe *sqe, i32 fd) {
     sqe->opcode = IORING_OP_CLOSE;
     sqe->fd     = fd;

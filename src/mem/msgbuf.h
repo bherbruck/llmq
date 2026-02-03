@@ -23,9 +23,15 @@
 #endif
 
 // Message buffer header (stored at start of each buffer slot)
+// Layout for scatter-gather: [header][remaining_len][topic_len][topic][payload]
+//                            ^                                  ^
+//                            |                                  |
+//                            0                              topic_end (packet_id insertion point)
 struct msg_header {
-    u32 ref_count; // Number of pending sends (atomic decrement on CQE)
-    u32 data_len;  // Length of encoded message data
+    u32 ref_count;   // Number of pending sends (atomic decrement on CQE)
+    u16 topic_end;   // Offset where topic ends (packet_id insertion point for QoS 1/2)
+    u16 total_len;   // Total encoded length (without packet_id for QoS 1/2)
+    u32 payload_len; // Payload length (for iovec[2])
 };
 
 // Message buffer pool
@@ -125,7 +131,9 @@ INLINE u32 msg_pool_alloc(struct msg_pool *p) {
     u32 idx              = p->free_stack[p->free_count];
     struct msg_header *h = msg_pool_header(p, idx);
     h->ref_count         = 0;
-    h->data_len          = 0;
+    h->topic_end         = 0;
+    h->total_len         = 0;
+    h->payload_len       = 0;
     return idx;
 }
 

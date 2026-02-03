@@ -7,6 +7,7 @@
 #include "sys/types.h"
 #include "config.h"
 #include "mem/pool.h"
+#include "mem/msgbuf.h"
 
 // =============================================================================
 // Compile-time limits (array sizes, can't change at runtime)
@@ -37,15 +38,16 @@ enum inflight_state {
     INFLIGHT_WAIT_PUBCOMP = 5, // QoS 2 sender: sent PUBREL, waiting for PUBCOMP
 };
 
-// Inflight message entry - metadata only, send buffer is separate
+// Inflight message entry - uses shared msg_pool buffer with scatter-gather
 struct inflight_msg {
-    u16 packet_id; // MQTT packet identifier
-    u8 state;      // enum inflight_state
-    u8 qos;        // Original QoS level
-    u8 dup_count;  // Retransmission count
-    u8 direction;  // 0 = outgoing (we sent), 1 = incoming (we received)
-    u16 data_len;  // Bytes used in send buffer
-    u32 buf_idx;   // Index into send buffer pool (BUF_POOL_INVALID if none)
+    u16 packet_id;       // MQTT packet identifier (native endian for lookups)
+    u8 packet_id_be[2];  // Big-endian packet ID for zero-copy writev
+    u8 state;            // enum inflight_state
+    u8 qos;              // Original QoS level
+    u8 dup_count;        // Retransmission count
+    u8 direction;        // 0 = outgoing (we sent), 1 = incoming (we received)
+    u32 msg_idx;         // Index into shared msg_pool (MSG_POOL_INVALID if none)
+    struct iovec iov[3]; // Scatter-gather: [hdr+topic][packet_id][payload]
 };
 
 // =============================================================================
@@ -148,7 +150,7 @@ INLINE void client_init(struct client_slot *c, i32 fd, u32 recv_buf_idx, u8 max_
     c->max_inflight     = max_inflight;
     for (u8 i = 0; i < LLMQ_MAX_INFLIGHT; i++) {
         c->inflight[i].state   = INFLIGHT_FREE;
-        c->inflight[i].buf_idx = BUF_POOL_INVALID;
+        c->inflight[i].msg_idx = MSG_POOL_INVALID;
     }
 }
 
@@ -249,30 +251,23 @@ INLINE void client_pending_pop(struct client_slot *c) {
 }
 
 // =============================================================================
-// Inflight Message Operations (with pooled buffers)
+// Inflight Message Operations (scatter-gather with shared msg_pool)
 // =============================================================================
 
 // Error codes for client_inflight_alloc
 #define INFLIGHT_ERR_CLIENT_FULL (-1) // Per-client inflight limit exceeded
-#define INFLIGHT_ERR_POOL_EMPTY  (-2) // Global send pool exhausted
 
-// Allocate inflight slot and send buffer from pool
-// Returns: inflight index (>=0), or error code (<0)
-INLINE i32 client_inflight_alloc(struct client_slot *c, u8 qos, u16 *out_packet_id,
-                                 struct buf_pool *send_pool) {
+// Allocate inflight slot with reference to shared msg_pool buffer
+// Returns: inflight index (>=0), or INFLIGHT_ERR_CLIENT_FULL
+INLINE i32 client_inflight_alloc_shared(struct client_slot *c, u8 qos, u32 msg_idx,
+                                        u16 *out_packet_id) {
     if (c->inflight_count >= c->max_inflight) {
         return INFLIGHT_ERR_CLIENT_FULL;
     }
 
-    // Find free slot
+    // Find free slot and allocate unique packet ID
     for (u8 i = 0; i < c->max_inflight; i++) {
         if (c->inflight[i].state == INFLIGHT_FREE) {
-            // Allocate send buffer from pool
-            u32 buf_idx = buf_pool_alloc(send_pool);
-            if (buf_idx == BUF_POOL_INVALID) {
-                return INFLIGHT_ERR_POOL_EMPTY;
-            }
-
             // Allocate unique packet ID
             u16 start_id = c->next_packet_id;
             do {
@@ -293,15 +288,15 @@ INLINE i32 client_inflight_alloc(struct client_slot *c, u8 qos, u16 *out_packet_
                 if (!in_use) {
                     *out_packet_id           = c->next_packet_id;
                     c->inflight[i].packet_id = c->next_packet_id;
-                    c->inflight[i].qos       = qos;
-                    c->inflight[i].dup_count = 0;
-                    c->inflight[i].direction = 0; // outgoing
-                    c->inflight[i].data_len  = 0;
-                    c->inflight[i].buf_idx   = buf_idx;
+                    // Store big-endian packet ID for wire format
+                    c->inflight[i].packet_id_be[0] = (u8)(c->next_packet_id >> 8);
+                    c->inflight[i].packet_id_be[1] = (u8)(c->next_packet_id & 0xFF);
+                    c->inflight[i].qos             = qos;
+                    c->inflight[i].dup_count       = 0;
+                    c->inflight[i].direction       = 0; // outgoing
+                    c->inflight[i].msg_idx         = msg_idx;
 
-                    if (qos == 0) {
-                        c->inflight[i].state = INFLIGHT_SENDING;
-                    } else if (qos == 1) {
+                    if (qos == 1) {
                         c->inflight[i].state = INFLIGHT_WAIT_PUBACK;
                     } else {
                         c->inflight[i].state = INFLIGHT_WAIT_PUBREC;
@@ -311,9 +306,7 @@ INLINE i32 client_inflight_alloc(struct client_slot *c, u8 qos, u16 *out_packet_
                 }
             } while (c->next_packet_id != start_id);
 
-            // Failed to find unique ID - free the buffer we allocated
-            buf_pool_free(send_pool, buf_idx);
-            return -1;
+            return -1; // No unique packet ID available
         }
     }
     return -1;
@@ -336,13 +329,14 @@ INLINE i32 client_inflight_track_incoming(struct client_slot *c, u16 packet_id) 
     // Find free slot
     for (u8 i = 0; i < c->max_inflight; i++) {
         if (c->inflight[i].state == INFLIGHT_FREE) {
-            c->inflight[i].packet_id = packet_id;
-            c->inflight[i].qos       = 2;
-            c->inflight[i].dup_count = 0;
-            c->inflight[i].direction = 1; // incoming
-            c->inflight[i].data_len  = 0;
-            c->inflight[i].buf_idx   = BUF_POOL_INVALID; // No send buffer needed
-            c->inflight[i].state     = INFLIGHT_WAIT_PUBREL;
+            c->inflight[i].packet_id       = packet_id;
+            c->inflight[i].packet_id_be[0] = (u8)(packet_id >> 8);
+            c->inflight[i].packet_id_be[1] = (u8)(packet_id & 0xFF);
+            c->inflight[i].qos             = 2;
+            c->inflight[i].dup_count       = 0;
+            c->inflight[i].direction       = 1;                // incoming
+            c->inflight[i].msg_idx         = MSG_POOL_INVALID; // No buffer needed
+            c->inflight[i].state           = INFLIGHT_WAIT_PUBREL;
             c->inflight_count++;
             return (i32)i;
         }
@@ -360,34 +354,48 @@ INLINE struct inflight_msg *client_inflight_find(struct client_slot *c, u16 pack
     return NULL;
 }
 
-// Free inflight entry and return its buffer to pool
+// Free inflight entry (caller must handle msg_pool refcount separately)
 INLINE void client_inflight_free(struct client_slot *c, struct inflight_msg *msg,
-                                 struct buf_pool *send_pool) {
+                                 struct msg_pool *pool) {
     if (msg->state != INFLIGHT_FREE) {
-        // Return buffer to pool if we have one
-        if (msg->buf_idx != BUF_POOL_INVALID && send_pool) {
-            buf_pool_free(send_pool, msg->buf_idx);
+        // Decrement msg_pool refcount if we have a reference
+        if (msg->msg_idx != MSG_POOL_INVALID && pool) {
+            msg_pool_unref(pool, msg->msg_idx);
         }
-        msg->buf_idx = BUF_POOL_INVALID;
+        msg->msg_idx = MSG_POOL_INVALID;
         msg->state   = INFLIGHT_FREE;
         if (c->inflight_count > 0)
             c->inflight_count--;
     }
 }
 
-// Get send buffer pointer for an inflight message
-INLINE u8 *client_inflight_buffer(struct inflight_msg *msg, struct buf_pool *send_pool) {
-    if (msg->buf_idx == BUF_POOL_INVALID) {
-        return NULL;
-    }
-    return buf_pool_get(send_pool, msg->buf_idx);
+// Setup scatter-gather iovecs for sending
+// Layout: [header+topic] [packet_id] [payload]
+INLINE void client_inflight_setup_iov(struct inflight_msg *msg, struct msg_pool *pool) {
+    if (msg->msg_idx == MSG_POOL_INVALID)
+        return;
+
+    struct msg_header *h = msg_pool_header(pool, msg->msg_idx);
+    u8 *data             = msg_pool_data(pool, msg->msg_idx);
+
+    // iov[0]: header + topic_len + topic (up to packet_id insertion point)
+    msg->iov[0].iov_base = data;
+    msg->iov[0].iov_len  = h->topic_end;
+
+    // iov[1]: packet_id (2 bytes, big-endian)
+    msg->iov[1].iov_base = msg->packet_id_be;
+    msg->iov[1].iov_len  = 2;
+
+    // iov[2]: payload
+    msg->iov[2].iov_base = data + h->topic_end;
+    msg->iov[2].iov_len  = h->payload_len;
 }
 
 // Free all inflight buffers for a client (call before client_free)
-INLINE void client_inflight_free_all(struct client_slot *c, struct buf_pool *send_pool) {
+INLINE void client_inflight_free_all(struct client_slot *c, struct msg_pool *pool) {
     for (u8 i = 0; i < LLMQ_MAX_INFLIGHT; i++) {
         if (c->inflight[i].state != INFLIGHT_FREE) {
-            client_inflight_free(c, &c->inflight[i], send_pool);
+            client_inflight_free(c, &c->inflight[i], pool);
         }
     }
 }

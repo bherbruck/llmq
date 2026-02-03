@@ -144,8 +144,8 @@ INLINE void broker_cleanup(struct broker *b) {
             if (c->recv_buf_idx != BUF_POOL_INVALID) {
                 buf_pool_free(&b->recv_pool, c->recv_buf_idx);
             }
-            // Free inflight buffers
-            client_inflight_free_all(c, &b->send_pool);
+            // Free inflight buffers (decrements msg_pool refcounts)
+            client_inflight_free_all(c, &b->msg_pool);
         }
     }
 
@@ -239,8 +239,8 @@ INLINE void broker_free_slot(struct broker *b, u32 slot_idx) {
         b->dormant_count--;
     }
 
-    // Free inflight buffers
-    client_inflight_free_all(c, &b->send_pool);
+    // Free inflight buffers (decrements msg_pool refcounts)
+    client_inflight_free_all(c, &b->msg_pool);
 
     // Remove from trie
     trie_remove_fd(&b->trie, slot_idx);
@@ -306,6 +306,7 @@ enum op_type {
     OP_SEND        = 3,
     OP_CLOSE       = 4,
     OP_SEND_SHARED = 5, // QoS 0 fan-out: context = msg_pool index
+    OP_SEND_WRITEV = 6, // QoS 1/2 scatter-gather: context = send_ctx (slot+inflight+qos)
 };
 
 // Pack: [8-bit op][24-bit fd][32-bit context]

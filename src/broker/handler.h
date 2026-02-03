@@ -16,8 +16,8 @@
 
 // Forward declare submit_send (defined in loop.h which includes this file)
 INLINE void submit_send(struct broker *b, i32 fd, const u8 *buf, u32 len);
-INLINE void submit_send_ctx(struct broker *b, i32 fd, const u8 *buf, u32 len, u32 ctx);
 INLINE void submit_send_shared(struct broker *b, i32 fd, const u8 *buf, u32 len, u32 msg_idx);
+INLINE void submit_send_writev(struct broker *b, i32 fd, struct iovec *iov, u32 ctx);
 
 // =============================================================================
 // Publish Fan-out Context
@@ -41,63 +41,52 @@ static i32 forward_qos0_shared(struct broker *b, struct client_slot *c, struct p
     return 0;
 }
 
-// Forward QoS 1/2 publish using per-subscriber inflight buffer
-// Needed because each subscriber gets a unique packet ID
-static i32 forward_qos12_inflight(struct broker *b, u32 slot_idx, struct client_slot *c,
-                                  struct mqtt_publish *pub, u8 effective_qos) {
+// Forward QoS 1/2 publish using scatter-gather with shared buffer
+// Each subscriber gets unique packet_id inserted via writev
+static i32 forward_qos12_writev(struct broker *b, u32 slot_idx, struct client_slot *c,
+                                struct publish_ctx *pctx, u8 effective_qos) {
     u16 packet_id = 0;
-    i32 inf_idx   = client_inflight_alloc(c, effective_qos, &packet_id, &b->send_pool);
+    i32 inf_idx   = client_inflight_alloc_shared(c, effective_qos, pctx->msg_idx, &packet_id);
 
     if (inf_idx < 0) {
         b->msgs_dropped++;
-        if (inf_idx == INFLIGHT_ERR_CLIENT_FULL) {
-            b->drops_inflight_full++;
-        } else if (inf_idx == INFLIGHT_ERR_POOL_EMPTY) {
-            b->drops_pool_empty++;
-        }
+        b->drops_inflight_full++;
         return -1;
     }
 
     struct inflight_msg *inf = &c->inflight[inf_idx];
-    u8 *send_buf             = client_inflight_buffer(inf, &b->send_pool);
-    if (!send_buf) {
-        client_inflight_free(c, inf, &b->send_pool);
-        return -1;
-    }
 
-    // Encode with subscriber's unique packet ID
-    struct mqtt_publish fwd = *pub;
-    fwd.qos                 = effective_qos;
-    fwd.dup                 = false;
+    // Increment refcount for this subscriber
+    msg_pool_ref(&b->msg_pool, pctx->msg_idx);
 
-    u32 fwd_len = mqtt_encode_publish(send_buf, &fwd, packet_id);
-    if (fwd_len > b->send_pool.buf_size) {
-        client_inflight_free(c, inf, &b->send_pool);
-        return -1;
-    }
-    inf->data_len = (u16)fwd_len;
+    // Setup scatter-gather iovecs
+    client_inflight_setup_iov(inf, &b->msg_pool);
 
     u32 ctx = make_send_ctx(slot_idx, (u8)inf_idx, effective_qos);
-    submit_send_ctx(b, c->fd, send_buf, fwd_len, ctx);
+    submit_send_writev(b, c->fd, inf->iov, ctx);
 
-    log_debug("  -> fd=%d qos=%d pkt_id=%d", c->fd, effective_qos, packet_id);
+    log_debug("  -> fd=%d qos=%d pkt_id=%d (writev)", c->fd, effective_qos, packet_id);
     return 0;
 }
 
 // Forward a publish to a single subscriber
-// Uses shared buffer for QoS 0, per-subscriber buffer for QoS 1/2
+// Uses shared buffer for QoS 0, scatter-gather for QoS 1/2
 static i32 forward_publish_to_client(struct broker *b, u32 slot_idx, struct client_slot *c,
                                      struct publish_ctx *pctx, u8 sub_qos) {
     // Downgrade QoS to minimum of publisher and subscriber
     u8 effective_qos = (pctx->pub->qos < sub_qos) ? pctx->pub->qos : sub_qos;
 
     if (effective_qos == 0 && pctx->msg_idx != MSG_POOL_INVALID) {
-        // QoS 0: Use shared buffer (zero-copy)
+        // QoS 0: Use shared buffer (zero-copy send)
         return forward_qos0_shared(b, c, pctx);
-    } else {
-        // QoS 1/2: Need unique packet ID per subscriber
-        return forward_qos12_inflight(b, slot_idx, c, pctx->pub, effective_qos);
+    } else if (pctx->msg_idx != MSG_POOL_INVALID) {
+        // QoS 1/2: Use scatter-gather (writev with shared buffer + unique packet_id)
+        return forward_qos12_writev(b, slot_idx, c, pctx, effective_qos);
     }
+    // No shared buffer available - drop message
+    b->msgs_dropped++;
+    b->drops_pool_empty++;
+    return -1;
 }
 
 // Callback for trie node match - send to matching slots
@@ -210,7 +199,7 @@ INLINE i32 process_mqtt_packet(struct broker *b, struct client_slot *c, const u8
         struct inflight_msg *inf = client_inflight_find(c, packet_id);
         if (inf && inf->state == INFLIGHT_WAIT_PUBACK) {
             log_debug("PUBACK fd=%d packet_id=%d - delivery complete", c->fd, packet_id);
-            client_inflight_free(c, inf, &b->send_pool);
+            client_inflight_free(c, inf, &b->msg_pool);
         } else {
             log_debug("PUBACK fd=%d packet_id=%d - unexpected", c->fd, packet_id);
         }
@@ -227,17 +216,10 @@ INLINE i32 process_mqtt_packet(struct broker *b, struct client_slot *c, const u8
             log_debug("PUBREC fd=%d packet_id=%d - sending PUBREL", c->fd, packet_id);
             inf->state = INFLIGHT_WAIT_PUBCOMP;
 
-            // Get send buffer and encode PUBREL
-            u8 *send_buf = client_inflight_buffer(inf, &b->send_pool);
-            if (send_buf) {
-                u8 pubrel[MQTT_PUBREL_SIZE];
-                mqtt_encode_pubrel(pubrel, packet_id);
-                for (u32 i = 0; i < MQTT_PUBREL_SIZE; i++) {
-                    send_buf[i] = pubrel[i];
-                }
-                inf->data_len = MQTT_PUBREL_SIZE;
-                submit_send(b, c->fd, send_buf, MQTT_PUBREL_SIZE);
-            }
+            // Send PUBREL using proto_buf
+            u8 *pbuf = client_get_proto_buf(c, b->proto_buf_count);
+            mqtt_encode_pubrel(pbuf, packet_id);
+            submit_send(b, c->fd, pbuf, MQTT_PUBREL_SIZE);
         } else {
             log_debug("PUBREC fd=%d packet_id=%d - unexpected", c->fd, packet_id);
         }
@@ -252,7 +234,7 @@ INLINE i32 process_mqtt_packet(struct broker *b, struct client_slot *c, const u8
         struct inflight_msg *inf = client_inflight_find(c, packet_id);
         if (inf && inf->state == INFLIGHT_WAIT_PUBREL && inf->direction == 1) {
             log_debug("PUBREL fd=%d packet_id=%d - sending PUBCOMP", c->fd, packet_id);
-            client_inflight_free(c, inf, &b->send_pool);
+            client_inflight_free(c, inf, &b->msg_pool);
         } else {
             log_debug("PUBREL fd=%d packet_id=%d - sending PUBCOMP (no state)", c->fd, packet_id);
         }
@@ -270,7 +252,7 @@ INLINE i32 process_mqtt_packet(struct broker *b, struct client_slot *c, const u8
         struct inflight_msg *inf = client_inflight_find(c, packet_id);
         if (inf && inf->state == INFLIGHT_WAIT_PUBCOMP) {
             log_debug("PUBCOMP fd=%d packet_id=%d - delivery complete", c->fd, packet_id);
-            client_inflight_free(c, inf, &b->send_pool);
+            client_inflight_free(c, inf, &b->msg_pool);
         } else {
             log_debug("PUBCOMP fd=%d packet_id=%d - unexpected", c->fd, packet_id);
         }
@@ -384,21 +366,32 @@ INLINE i32 process_mqtt_packet(struct broker *b, struct client_slot *c, const u8
         pctx.msg_data = NULL;
         memset(pctx.sent_bitmap, 0, sizeof(pctx.sent_bitmap));
 
-        // For QoS 0: Allocate shared buffer and encode once (zero-copy fan-out)
-        if (pub_pkt.qos == 0) {
-            pctx.msg_idx = msg_pool_alloc(&b->msg_pool);
-            if (pctx.msg_idx != MSG_POOL_INVALID) {
-                pctx.msg_data              = msg_pool_data(&b->msg_pool, pctx.msg_idx);
-                pctx.msg_len               = mqtt_encode_publish(pctx.msg_data, &pub_pkt, 0);
-                struct msg_header *msg_hdr = msg_pool_header(&b->msg_pool, pctx.msg_idx);
-                msg_hdr->data_len          = pctx.msg_len;
+        // Allocate shared buffer and encode for fan-out
+        pctx.msg_idx = msg_pool_alloc(&b->msg_pool);
+        if (pctx.msg_idx != MSG_POOL_INVALID) {
+            pctx.msg_data              = msg_pool_data(&b->msg_pool, pctx.msg_idx);
+            struct msg_header *msg_hdr = msg_pool_header(&b->msg_pool, pctx.msg_idx);
+
+            if (pub_pkt.qos == 0) {
+                // QoS 0: Encode complete packet (no packet_id)
+                pctx.msg_len       = mqtt_encode_publish(pctx.msg_data, &pub_pkt, 0);
+                msg_hdr->total_len = (u16)pctx.msg_len;
+            } else {
+                // QoS 1/2: Encode in scatter-gather format (without packet_id)
+                u32 scatter_len = 0;
+                u32 payload_len = 0;
+                u32 topic_end   = mqtt_encode_publish_scatter(pctx.msg_data, &pub_pkt, &scatter_len,
+                                                              &payload_len);
+                msg_hdr->topic_end   = (u16)topic_end;
+                msg_hdr->total_len   = (u16)scatter_len;
+                msg_hdr->payload_len = payload_len;
+                pctx.msg_len         = scatter_len;
             }
-            // If allocation fails, fall through to per-subscriber buffers
         }
 
         trie_match(&b->trie, pub_pkt.topic.ptr, pub_pkt.topic.len, publish_node_cb, &pctx);
 
-        // For QoS 0: If no subscribers used the shared buffer, free it now
+        // If no subscribers used the shared buffer, free it now
         if (pctx.msg_idx != MSG_POOL_INVALID) {
             struct msg_header *msg_hdr = msg_pool_header(&b->msg_pool, pctx.msg_idx);
             if (msg_hdr->ref_count == 0) {
