@@ -65,7 +65,7 @@ INLINE void submit_send(struct broker *b, i32 fd, const u8 *buf, u32 len) {
     ring_submit_sqe(&b->ring);
 }
 
-// Submit send with context for tracking inflight buffers
+// Submit send with context for tracking inflight buffers (QoS 1/2)
 INLINE void submit_send_ctx(struct broker *b, i32 fd, const u8 *buf, u32 len, u32 ctx) {
     struct io_uring_sqe *sqe = get_sqe_with_flush(b);
     if (!sqe) {
@@ -74,6 +74,21 @@ INLINE void submit_send_ctx(struct broker *b, i32 fd, const u8 *buf, u32 len, u3
     }
     ring_prep_send(sqe, fd, buf, len, 0);
     sqe->user_data = make_user_data(OP_SEND, (u32)fd, ctx);
+    ring_submit_sqe(&b->ring);
+}
+
+// Submit send with shared message buffer (QoS 0 zero-copy fan-out)
+// Context is the msg_pool index for refcount tracking
+INLINE void submit_send_shared(struct broker *b, i32 fd, const u8 *buf, u32 len, u32 msg_idx) {
+    struct io_uring_sqe *sqe = get_sqe_with_flush(b);
+    if (!sqe) {
+        log_error("SQ full, can't submit shared send");
+        // Decrement refcount since we won't get a CQE
+        msg_pool_unref(&b->msg_pool, msg_idx);
+        return;
+    }
+    ring_prep_send(sqe, fd, buf, len, 0);
+    sqe->user_data = make_user_data(OP_SEND_SHARED, (u32)fd, msg_idx);
     ring_submit_sqe(&b->ring);
 }
 
@@ -230,6 +245,21 @@ INLINE void handle_send(struct broker *b, struct io_uring_cqe *cqe) {
     }
 }
 
+// Handle completion of shared buffer send (QoS 0 zero-copy fan-out)
+INLINE void handle_send_shared(struct broker *b, struct io_uring_cqe *cqe) {
+    u32 msg_idx = ud_ctx(cqe->user_data);
+
+    if (cqe->res < 0) {
+        i32 fd = (i32)ud_fd(cqe->user_data);
+        log_debug("shared send error fd=%d err=%d", fd, cqe->res);
+    } else {
+        b->bytes_sent += (u64)cqe->res;
+    }
+
+    // Decrement refcount, free buffer if this was the last send
+    msg_pool_unref(&b->msg_pool, msg_idx);
+}
+
 INLINE void handle_close(struct broker *b, struct io_uring_cqe *cqe) {
     i32 fd = (i32)ud_fd(cqe->user_data);
 
@@ -258,6 +288,9 @@ INLINE void dispatch_cqe(struct broker *b, struct io_uring_cqe *cqe) {
         break;
     case OP_SEND:
         handle_send(b, cqe);
+        break;
+    case OP_SEND_SHARED:
+        handle_send_shared(b, cqe);
         break;
     case OP_CLOSE:
         handle_close(b, cqe);

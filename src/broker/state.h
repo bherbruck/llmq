@@ -9,6 +9,7 @@
 #include "sys/io_uring.h"
 #include "broker/client.h"
 #include "broker/trie.h"
+#include "mem/msgbuf.h"
 #include "config.h"
 
 // =============================================================================
@@ -36,7 +37,8 @@ struct broker {
 
     // Buffer pools (shared across all clients)
     struct buf_pool recv_pool;  // Receive buffers (one per active client)
-    struct buf_pool send_pool;  // Send buffers for inflight messages
+    struct buf_pool send_pool;  // Send buffers for QoS 1/2 inflight messages
+    struct msg_pool msg_pool;   // Shared message buffers for QoS 0 fan-out
 
     // Free slot tracking
     u32 free_head;     // Head of free list
@@ -77,10 +79,16 @@ INLINE i32 broker_init(struct broker *b, u32 max_clients, u32 max_fds, u8 max_in
         return -1;
     }
 
-    // Send pool: shared pool for all inflight messages
-    // Size = expected concurrent inflight across all clients
+    // Send pool: shared pool for QoS 1/2 inflight messages
     if (buf_pool_init(&b->send_pool, send_pool_count, send_buf_size) < 0) {
         buf_pool_cleanup(&b->recv_pool);
+        return -1;
+    }
+
+    // Message pool: shared buffers for QoS 0 zero-copy fan-out
+    if (msg_pool_init(&b->msg_pool, LLMQ_MSG_BUF_COUNT, LLMQ_MSG_BUF_SIZE) < 0) {
+        buf_pool_cleanup(&b->recv_pool);
+        buf_pool_cleanup(&b->send_pool);
         return -1;
     }
 
@@ -91,6 +99,7 @@ INLINE i32 broker_init(struct broker *b, u32 max_clients, u32 max_fds, u8 max_in
     if (IS_ERR(b->clients)) {
         buf_pool_cleanup(&b->recv_pool);
         buf_pool_cleanup(&b->send_pool);
+        msg_pool_cleanup(&b->msg_pool);
         return -1;
     }
 
@@ -102,6 +111,7 @@ INLINE i32 broker_init(struct broker *b, u32 max_clients, u32 max_fds, u8 max_in
         sys_munmap(b->clients, clients_size);
         buf_pool_cleanup(&b->recv_pool);
         buf_pool_cleanup(&b->send_pool);
+        msg_pool_cleanup(&b->msg_pool);
         return -1;
     }
 
@@ -147,6 +157,7 @@ INLINE void broker_cleanup(struct broker *b) {
     }
     buf_pool_cleanup(&b->recv_pool);
     buf_pool_cleanup(&b->send_pool);
+    msg_pool_cleanup(&b->msg_pool);
 }
 
 // =============================================================================
@@ -290,10 +301,11 @@ INLINE void broker_slot_resume(struct broker *b, u32 slot_idx, i32 fd) {
 // =============================================================================
 
 enum op_type {
-    OP_ACCEPT = 1,
-    OP_RECV   = 2,
-    OP_SEND   = 3,
-    OP_CLOSE  = 4,
+    OP_ACCEPT      = 1,
+    OP_RECV        = 2,
+    OP_SEND        = 3,
+    OP_CLOSE       = 4,
+    OP_SEND_SHARED = 5, // QoS 0 fan-out: context = msg_pool index
 };
 
 // Pack: [8-bit op][24-bit fd][32-bit context]
