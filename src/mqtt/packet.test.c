@@ -1,5 +1,4 @@
 // packet.test.c - Tests for mqtt/packet.h
-// NOLINTBEGIN(readability-magic-numbers,cppcoreguidelines-avoid-magic-numbers)
 
 #define TESTING
 #include "test/test.h"
@@ -7,7 +6,7 @@
 
 TEST(fixed_header_connect) {
     // CONNECT with remaining length 12
-    u8 buf[] = {0x10, 0x0c};
+    u8 buf[] = {MQTT_CONNECT << MQTT_TYPE_SHIFT, 12};
     struct mqtt_fixed_header hdr;
     i32 rc = mqtt_parse_fixed_header(buf, sizeof(buf), &hdr);
     ASSERT_EQ(rc, 2);
@@ -17,19 +16,19 @@ TEST(fixed_header_connect) {
 }
 
 TEST(fixed_header_publish_qos1) {
-    // PUBLISH QoS 1, remaining length 10
-    u8 buf[] = {0x32, 0x0a}; // 0x32 = PUBLISH(3) << 4 | QoS1(2)
+    // PUBLISH QoS 1 (flags=0x02), remaining length 10
+    u8 buf[] = {(MQTT_PUBLISH << MQTT_TYPE_SHIFT) | 0x02, 10};
     struct mqtt_fixed_header hdr;
     i32 rc = mqtt_parse_fixed_header(buf, sizeof(buf), &hdr);
     ASSERT_EQ(rc, 2);
     ASSERT_EQ(hdr.type, MQTT_PUBLISH);
-    ASSERT_EQ(hdr.flags, 0x02); // QoS 1
+    ASSERT_EQ(hdr.flags, 0x02);
     ASSERT_EQ(hdr.remaining_len, 10);
 }
 
 TEST(fixed_header_vbi_two_bytes) {
     // Remaining length 128 requires 2 bytes: 0x80 0x01
-    u8 buf[] = {0x10, 0x80, 0x01};
+    u8 buf[] = {MQTT_CONNECT << MQTT_TYPE_SHIFT, MQTT_VBI_CONTINUE, 0x01};
     struct mqtt_fixed_header hdr;
     i32 rc = mqtt_parse_fixed_header(buf, sizeof(buf), &hdr);
     ASSERT_EQ(rc, 3);
@@ -37,7 +36,7 @@ TEST(fixed_header_vbi_two_bytes) {
 }
 
 TEST(fixed_header_incomplete) {
-    u8 buf[] = {0x10};
+    u8 buf[] = {MQTT_CONNECT << MQTT_TYPE_SHIFT};
     struct mqtt_fixed_header hdr;
     i32 rc = mqtt_parse_fixed_header(buf, sizeof(buf), &hdr);
     ASSERT_EQ(rc, MQTT_INCOMPLETE);
@@ -45,14 +44,14 @@ TEST(fixed_header_incomplete) {
 
 TEST(packet_complete_yes) {
     // Complete PINGREQ: type + remaining_len(0)
-    u8 buf[] = {0xc0, 0x00};
+    u8 buf[] = {MQTT_PINGREQ << MQTT_TYPE_SHIFT, 0x00};
     i32 rc   = mqtt_packet_complete(buf, sizeof(buf));
     ASSERT_EQ(rc, 2);
 }
 
 TEST(packet_complete_no) {
     // CONNECT header says 12 bytes follow, but we only have 4
-    u8 buf[] = {0x10, 0x0c, 0x00, 0x00};
+    u8 buf[] = {MQTT_CONNECT << MQTT_TYPE_SHIFT, 12, 0x00, 0x00};
     i32 rc   = mqtt_packet_complete(buf, sizeof(buf));
     ASSERT_EQ(rc, MQTT_INCOMPLETE);
 }
@@ -84,8 +83,6 @@ TEST(encode_remaining_len_two_bytes) {
     u8 buf[4];
     u32 n = mqtt_encode_remaining_len(buf, 128);
     ASSERT_EQ(n, 2);
-    ASSERT_EQ(buf[0], 0x80);
+    ASSERT_EQ(buf[0], MQTT_VBI_CONTINUE);
     ASSERT_EQ(buf[1], 0x01);
 }
-
-// NOLINTEND(readability-magic-numbers,cppcoreguidelines-avoid-magic-numbers)

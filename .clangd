@@ -33,3 +33,13 @@ InlayHints:
 
 Hover:
   ShowAKA: true
+
+---
+# Relax checks for test files
+If:
+  PathMatch: .*\.test\..*
+Diagnostics:
+  ClangTidy:
+    Remove:
+      - readability-magic-numbers
+      - cppcoreguidelines-avoid-magic-numbers

@@ -46,9 +46,9 @@ sanitize: _bindir
 
 # === Lint & Analysis ===
 
-# Run clang-tidy on all source files
+# Run clang-tidy on all source files (excluding tests)
 lint:
-    find {{srcdir}} -name '*.c' -o -name '*.h' | xargs clang-tidy --config-file=.clang-tidy
+    find {{srcdir}} \( -name '*.c' -o -name '*.h' \) ! -name '*.test.*' | xargs clang-tidy --config-file=.clang-tidy
 
 # Run clang static analyzer
 analyze: _bindir
