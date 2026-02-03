@@ -13,23 +13,26 @@ srcdir := "src"
 bindir := "bin"
 out := bindir / "broker"
 
+# Source files
+sources := srcdir / "main.c " + srcdir / "sys/io_uring.c"
+
 # Base compiler flags
-cflags := "-std=c11 -Wall -Wextra -Wpedantic -ffreestanding -nostdlib -nostdinc -fno-stack-protector -fno-pic -I" + srcdir
+cflags := "-std=c11 -Wall -Wextra -Wpedantic -Wno-unused-function -ffreestanding -nostdlib -fno-stack-protector -fno-pic -fno-builtin -I" + srcdir
 
 # Clang-specific flags
-clang_flags := "--target=" + target + " -fuse-ld=" + ld + " --rtlib=compiler-rt"
+clang_flags := "--target=" + target + " -fuse-ld=" + ld + " -Wl,--no-pie -static"
 
 # === Build Recipes ===
 
 # Build release binary (default)
 build: _bindir
-    {{cc}} {{cflags}} {{clang_flags}} -O3 -flto -DNDEBUG -o {{out}} {{srcdir}}/main.c
+    {{cc}} {{cflags}} {{clang_flags}} -O3 -flto -DNDEBUG -o {{out}} {{sources}}
     strip {{out}}
     @echo "Built: {{out}} ($(stat -c%s {{out}}) bytes)"
 
 # Build debug binary
 debug: _bindir
-    {{cc}} {{cflags}} {{clang_flags}} -g -O0 -DDEBUG -o {{out}} {{srcdir}}/main.c
+    {{cc}} {{cflags}} {{clang_flags}} -g -O1 -DDEBUG -o {{out}} {{sources}}
     @echo "Built: {{out}} (debug)"
 
 # Build with sanitizers (requires libc, for testing only)

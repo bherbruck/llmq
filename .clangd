@@ -1,6 +1,7 @@
 # .clangd - LSP config for freestanding C
 CompileFlags:
   Add:
+    - -xc
     - -std=c11
     - -Wall
     - -Wextra
@@ -18,7 +19,8 @@ CompileFlags:
     - -W*
 
 Diagnostics:
-  ClangTidy: true
+  ClangTidy:
+    Add: ['*']
   UnusedIncludes: Strict
   MissingIncludes: Strict
 

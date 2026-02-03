@@ -13,10 +13,23 @@ Checks: >
   readability-isolate-declaration,
   readability-misleading-indentation,
   -bugprone-easily-swappable-parameters,
+  -bugprone-reserved-identifier,
   -cert-dcl37-c,
   -cert-dcl51-cpp,
   -clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling,
-  -misc-no-recursion
+  -misc-no-recursion,
+  -hicpp-no-assembler,
+  -hicpp-signed-bitwise,
+  -readability-identifier-length,
+  -readability-math-missing-parentheses,
+  -cppcoreguidelines-init-variables,
+  -cppcoreguidelines-avoid-magic-numbers,
+  -readability-magic-numbers,
+  -altera-*,
+  -google-readability-todo,
+  -misc-include-cleaner,
+  -misc-unused-parameters,
+  -performance-no-int-to-ptr
 
 # Treat these as errors - they catch real bugs
 WarningsAsErrors: >
