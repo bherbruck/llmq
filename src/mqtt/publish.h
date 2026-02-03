@@ -173,12 +173,11 @@ INLINE u32 mqtt_encode_publish(u8 *buf, const struct mqtt_publish *pub, u16 pack
 // out_total is set to total length (header + topic + payload, WITHOUT packet_id)
 INLINE u32 mqtt_encode_publish_scatter(u8 *buf, const struct mqtt_publish *pub, u32 *out_total,
                                        u32 *out_payload_len) {
-    // Fixed header flags
+    // Fixed header flags - preserve actual QoS for correct subscriber behavior
     u8 flags = 0;
     if (pub->retain)
         flags |= MQTT_PUBLISH_FLAG_RETAIN;
-    // Always encode as QoS 1 for scatter-gather (packet_id will be inserted)
-    flags |= (1 << MQTT_PUBLISH_FLAG_QOS_SHIFT) & MQTT_PUBLISH_FLAG_QOS_MASK;
+    flags |= (pub->qos << MQTT_PUBLISH_FLAG_QOS_SHIFT) & MQTT_PUBLISH_FLAG_QOS_MASK;
     if (pub->dup)
         flags |= MQTT_PUBLISH_FLAG_DUP;
 
