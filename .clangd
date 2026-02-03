@@ -1,0 +1,32 @@
+# .clangd - LSP config for freestanding C
+CompileFlags:
+  Add:
+    - -std=c11
+    - -Wall
+    - -Wextra
+    - -Wpedantic
+    - -Wconversion
+    - -Wshadow
+    - -Wundef
+    - -ffreestanding
+    - -nostdlib
+    - -fno-stack-protector
+    - --target=x86_64-unknown-linux-gnu
+    - -I./src
+  # Suppress warnings that don't apply to freestanding
+  Remove:
+    - -W*
+
+Diagnostics:
+  ClangTidy: true
+  UnusedIncludes: Strict
+  MissingIncludes: Strict
+
+InlayHints:
+  Enabled: true
+  ParameterNames: true
+  DeducedTypes: true
+  Designators: true
+
+Hover:
+  ShowAKA: true
