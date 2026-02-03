@@ -134,8 +134,9 @@ i32 broker_main(i32 argc, char **argv, char **envp) {
     u64 recv_mem   = (u64)cfg.limits_max_conns * LLMQ_RECV_BUF_SIZE;
     u64 send_mem   = (u64)send_pool_count * LLMQ_SEND_BUF_SIZE;
     u64 msg_mem    = (u64)LLMQ_MSG_BUF_COUNT * LLMQ_MSG_BUF_SIZE;
-    log_info("Memory: clients=%lu KB, recv=%lu MB, send=%lu MB, msg=%lu MB", client_mem / KB_DIVISOR,
-             recv_mem / MB_DIVISOR, send_mem / MB_DIVISOR, msg_mem / MB_DIVISOR);
+    log_info("Memory: clients=%lu KB, recv=%lu MB, send=%lu MB, msg=%lu MB",
+             client_mem / KB_DIVISOR, recv_mem / MB_DIVISOR, send_mem / MB_DIVISOR,
+             msg_mem / MB_DIVISOR);
 
     log_info("Initializing io_uring with %d entries...", cfg.limits_ring_entries);
 
@@ -166,10 +167,12 @@ i32 broker_main(i32 argc, char **argv, char **envp) {
     broker_cleanup(&b);
 
     log_info("Stats: accepts=%lu published=%lu", b.accepts, b.msgs_published);
-    u32 send_pct =
-        b.send_pool.capacity > 0 ? (b.send_pool.high_water * PERCENT_MULTIPLIER) / b.send_pool.capacity : 0;
-    u32 msg_pct =
-        b.msg_pool.capacity > 0 ? (b.msg_pool.high_water * PERCENT_MULTIPLIER) / b.msg_pool.capacity : 0;
+    u32 send_pct = b.send_pool.capacity > 0
+                       ? (b.send_pool.high_water * PERCENT_MULTIPLIER) / b.send_pool.capacity
+                       : 0;
+    u32 msg_pct  = b.msg_pool.capacity > 0
+                       ? (b.msg_pool.high_water * PERCENT_MULTIPLIER) / b.msg_pool.capacity
+                       : 0;
     log_info("Pools: send=%u/%u (%u%%), msg=%u/%u (%u%%), recv=%u/%u", b.send_pool.high_water,
              b.send_pool.capacity, send_pct, b.msg_pool.high_water, b.msg_pool.capacity, msg_pct,
              b.recv_pool.high_water, b.recv_pool.capacity);

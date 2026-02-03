@@ -27,15 +27,14 @@ struct publish_ctx {
     struct broker *broker;
     struct mqtt_publish *pub;
     u64 sent_bitmap[TRIE_FD_SLOTS]; // Track which slots we've sent to
-    u32 msg_idx;                     // Shared msg_buffer index (QoS 0 only)
-    u32 msg_len;                     // Encoded message length
-    u8 *msg_data;                    // Pointer to encoded data
+    u32 msg_idx;                    // Shared msg_buffer index (QoS 0 only)
+    u32 msg_len;                    // Encoded message length
+    u8 *msg_data;                   // Pointer to encoded data
 };
 
 // Forward QoS 0 publish using shared buffer (zero-copy fan-out)
 // The shared buffer is reference-counted, freed when all sends complete
-static i32 forward_qos0_shared(struct broker *b, struct client_slot *c,
-                                struct publish_ctx *pctx) {
+static i32 forward_qos0_shared(struct broker *b, struct client_slot *c, struct publish_ctx *pctx) {
     // Increment refcount before submitting send
     msg_pool_ref(&b->msg_pool, pctx->msg_idx);
     submit_send_shared(b, c->fd, pctx->msg_data, pctx->msg_len, pctx->msg_idx);
@@ -45,7 +44,7 @@ static i32 forward_qos0_shared(struct broker *b, struct client_slot *c,
 // Forward QoS 1/2 publish using per-subscriber inflight buffer
 // Needed because each subscriber gets a unique packet ID
 static i32 forward_qos12_inflight(struct broker *b, u32 slot_idx, struct client_slot *c,
-                                   struct mqtt_publish *pub, u8 effective_qos) {
+                                  struct mqtt_publish *pub, u8 effective_qos) {
     u16 packet_id = 0;
     i32 inf_idx   = client_inflight_alloc(c, effective_qos, &packet_id, &b->send_pool);
 
@@ -297,7 +296,8 @@ INLINE i32 process_mqtt_packet(struct broker *b, struct client_slot *c, const u8
 
             if (sub_rc != 0) {
                 log_warn("SUBSCRIBE failed slot=%d topic='%.*s'", slot_idx,
-                         (i32)sub_pkt.filters[i].topic.len, (const char *)sub_pkt.filters[i].topic.ptr);
+                         (i32)sub_pkt.filters[i].topic.len,
+                         (const char *)sub_pkt.filters[i].topic.ptr);
             }
 
             log_debug("SUBSCRIBE fd=%d slot=%d topic='%.*s' qos=%d granted=%d", c->fd, slot_idx,
@@ -305,8 +305,9 @@ INLINE i32 process_mqtt_packet(struct broker *b, struct client_slot *c, const u8
                       sub_pkt.filters[i].qos, return_codes[i]);
         }
 
-        u8 *pbuf       = client_get_proto_buf(c, b->proto_buf_count);
-        u32 suback_len = mqtt_encode_suback(pbuf, sub_pkt.packet_id, return_codes, sub_pkt.filter_count);
+        u8 *pbuf = client_get_proto_buf(c, b->proto_buf_count);
+        u32 suback_len =
+            mqtt_encode_suback(pbuf, sub_pkt.packet_id, return_codes, sub_pkt.filter_count);
         submit_send(b, c->fd, pbuf, suback_len);
         break;
     }
@@ -376,10 +377,10 @@ INLINE i32 process_mqtt_packet(struct broker *b, struct client_slot *c, const u8
         }
 
         struct publish_ctx pctx;
-        pctx.broker  = b;
-        pctx.pub     = &pub_pkt;
-        pctx.msg_idx = MSG_POOL_INVALID;
-        pctx.msg_len = 0;
+        pctx.broker   = b;
+        pctx.pub      = &pub_pkt;
+        pctx.msg_idx  = MSG_POOL_INVALID;
+        pctx.msg_len  = 0;
         pctx.msg_data = NULL;
         memset(pctx.sent_bitmap, 0, sizeof(pctx.sent_bitmap));
 
@@ -387,8 +388,8 @@ INLINE i32 process_mqtt_packet(struct broker *b, struct client_slot *c, const u8
         if (pub_pkt.qos == 0) {
             pctx.msg_idx = msg_pool_alloc(&b->msg_pool);
             if (pctx.msg_idx != MSG_POOL_INVALID) {
-                pctx.msg_data = msg_pool_data(&b->msg_pool, pctx.msg_idx);
-                pctx.msg_len  = mqtt_encode_publish(pctx.msg_data, &pub_pkt, 0);
+                pctx.msg_data              = msg_pool_data(&b->msg_pool, pctx.msg_idx);
+                pctx.msg_len               = mqtt_encode_publish(pctx.msg_data, &pub_pkt, 0);
                 struct msg_header *msg_hdr = msg_pool_header(&b->msg_pool, pctx.msg_idx);
                 msg_hdr->data_len          = pctx.msg_len;
             }

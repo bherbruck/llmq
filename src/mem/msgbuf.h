@@ -30,15 +30,15 @@ struct msg_header {
 
 // Message buffer pool
 struct msg_pool {
-    u8 *buffers;       // mmap'd array of buffer slots
-    u32 *free_stack;   // Stack of free buffer indices
-    u32 slot_size;     // Size of each slot (header + data)
-    u32 capacity;      // Total number of slots
-    u32 free_count;    // Number of free slots
-    u32 high_water;    // Peak usage
+    u8 *buffers;     // mmap'd array of buffer slots
+    u32 *free_stack; // Stack of free buffer indices
+    u32 slot_size;   // Size of each slot (header + data)
+    u32 capacity;    // Total number of slots
+    u32 free_count;  // Number of free slots
+    u32 high_water;  // Peak usage
 };
 
-#define MSG_POOL_INVALID ((u32)-1)
+#define MSG_POOL_INVALID ((u32) - 1)
 
 // Header size aligned to 8 bytes for data alignment
 #define MSG_HEADER_SIZE ((sizeof(struct msg_header) + 7) & ~7ULL)
@@ -52,16 +52,16 @@ INLINE i32 msg_pool_init(struct msg_pool *p, u32 capacity, u32 max_msg_size) {
 
     // mmap the buffer array
     usize buffers_size = (usize)capacity * p->slot_size;
-    p->buffers         = (u8 *)sys_mmap(NULL, buffers_size, PROT_READ | PROT_WRITE,
-                                        MAP_PRIVATE | MAP_ANON, -1, 0);
+    p->buffers =
+        (u8 *)sys_mmap(NULL, buffers_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
     if (IS_ERR(p->buffers)) {
         return -1;
     }
 
     // mmap the free stack
     usize stack_size = (usize)capacity * sizeof(u32);
-    p->free_stack    = (u32 *)sys_mmap(NULL, stack_size, PROT_READ | PROT_WRITE,
-                                       MAP_PRIVATE | MAP_ANON, -1, 0);
+    p->free_stack =
+        (u32 *)sys_mmap(NULL, stack_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
     if (IS_ERR(p->free_stack)) {
         sys_munmap(p->buffers, buffers_size);
         return -1;

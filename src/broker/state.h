@@ -36,9 +36,9 @@ struct broker {
     i32 *fd_to_slot;
 
     // Buffer pools (shared across all clients)
-    struct buf_pool recv_pool;  // Receive buffers (one per active client)
-    struct buf_pool send_pool;  // Send buffers for QoS 1/2 inflight messages
-    struct msg_pool msg_pool;   // Shared message buffers for QoS 0 fan-out
+    struct buf_pool recv_pool; // Receive buffers (one per active client)
+    struct buf_pool send_pool; // Send buffers for QoS 1/2 inflight messages
+    struct msg_pool msg_pool;  // Shared message buffers for QoS 0 fan-out
 
     // Free slot tracking
     u32 free_head;     // Head of free list
@@ -94,8 +94,8 @@ INLINE i32 broker_init(struct broker *b, u32 max_clients, u32 max_fds, u8 max_in
 
     // mmap client slots (now much smaller without embedded buffers)
     usize clients_size = max_clients * sizeof(struct client_slot);
-    b->clients = (struct client_slot *)sys_mmap(NULL, clients_size, PROT_READ | PROT_WRITE,
-                                                 MAP_PRIVATE | MAP_ANON, -1, 0);
+    b->clients         = (struct client_slot *)sys_mmap(NULL, clients_size, PROT_READ | PROT_WRITE,
+                                                        MAP_PRIVATE | MAP_ANON, -1, 0);
     if (IS_ERR(b->clients)) {
         buf_pool_cleanup(&b->recv_pool);
         buf_pool_cleanup(&b->send_pool);
@@ -105,8 +105,8 @@ INLINE i32 broker_init(struct broker *b, u32 max_clients, u32 max_fds, u8 max_in
 
     // mmap fd_to_slot mapping
     usize fd_map_size = max_fds * sizeof(i32);
-    b->fd_to_slot = (i32 *)sys_mmap(NULL, fd_map_size, PROT_READ | PROT_WRITE,
-                                     MAP_PRIVATE | MAP_ANON, -1, 0);
+    b->fd_to_slot =
+        (i32 *)sys_mmap(NULL, fd_map_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
     if (IS_ERR(b->fd_to_slot)) {
         sys_munmap(b->clients, clients_size);
         buf_pool_cleanup(&b->recv_pool);
@@ -117,12 +117,12 @@ INLINE i32 broker_init(struct broker *b, u32 max_clients, u32 max_fds, u8 max_in
 
     // Initialize client slots as free list
     for (u32 i = 0; i < max_clients; i++) {
-        b->clients[i].state       = CLIENT_FREE;
-        b->clients[i].fd          = (i32)(i + 1); // Next free slot (abuse fd field)
+        b->clients[i].state        = CLIENT_FREE;
+        b->clients[i].fd           = (i32)(i + 1); // Next free slot (abuse fd field)
         b->clients[i].recv_buf_idx = BUF_POOL_INVALID;
     }
     b->clients[max_clients - 1].fd = -1; // End of list
-    b->free_head = 0;
+    b->free_head                   = 0;
 
     // Initialize fd_to_slot mapping
     for (u32 i = 0; i < max_fds; i++) {
@@ -287,10 +287,10 @@ INLINE void broker_slot_resume(struct broker *b, u32 slot_idx, i32 fd) {
         return; // No buffers available, can't resume
     }
 
-    c->state        = CLIENT_ACTIVE;
-    c->fd           = fd;
-    c->recv_buf_idx = recv_buf_idx;
-    c->recv_len     = 0;
+    c->state          = CLIENT_ACTIVE;
+    c->fd             = fd;
+    c->recv_buf_idx   = recv_buf_idx;
+    c->recv_len       = 0;
     b->fd_to_slot[fd] = (i32)slot_idx;
     b->active_count++;
     b->dormant_count--;
