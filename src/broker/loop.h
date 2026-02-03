@@ -143,6 +143,13 @@ INLINE void process_recv_buffer(struct broker *b, struct client_slot *c) {
         i32 consumed = process_mqtt_packet(b, c, c->recv_buf, (u32)packet_len);
 
         if (consumed < 0) {
+            // Negative return = close connection
+            // Only warn if it wasn't a clean DISCONNECT (type=14)
+            struct mqtt_fixed_header hdr;
+            mqtt_parse_fixed_header(c->recv_buf, c->recv_len, &hdr);
+            if (hdr.type != MQTT_DISCONNECT) {
+                log_warn("Packet error fd=%d type=%d, closing", c->fd, hdr.type);
+            }
             submit_close(b, c->fd);
             return;
         }
@@ -165,7 +172,9 @@ INLINE void handle_recv(struct broker *b, struct io_uring_cqe *cqe) {
 
     if (cqe->res <= 0) {
         if (cqe->res < 0) {
-            log_error("recv error fd=%d err=%d", fd, cqe->res);
+            log_warn("recv error fd=%d err=%d", fd, cqe->res);
+        } else {
+            log_debug("client closed connection fd=%d", fd);
         }
         submit_close(b, fd);
         return;
@@ -221,7 +230,7 @@ INLINE void handle_close(struct broker *b, struct io_uring_cqe *cqe) {
     struct client_slot *c = broker_get_client_by_fd(b, fd);
     if (c) {
         i32 slot_idx = b->fd_to_slot[fd];
-        log_debug("client disconnected fd=%d slot=%d", fd, slot_idx);
+        log_debug("disconnect fd=%d slot=%d clean=%d", fd, slot_idx, c->clean_session);
         if (c->clean_session) {
             broker_free_slot(b, (u32)slot_idx);
         } else {
@@ -256,15 +265,24 @@ INLINE void dispatch_cqe(struct broker *b, struct io_uring_cqe *cqe) {
 // Main Event Loop
 // =============================================================================
 
+#define ACCEPT_BATCH 32
+
 INLINE i32 broker_run(struct broker *b) {
     b->running = true;
-    submit_accept(b);
+
+    // Submit multiple accepts to handle connection bursts
+    for (i32 i = 0; i < ACCEPT_BATCH; i++) {
+        submit_accept(b);
+    }
 
     log_info("Entering event loop...");
 
     while (b->running) {
         i32 rc = ring_submit(&b->ring, 1);
         if (rc < 0) {
+            if (rc == -EINTR) {
+                continue; // Signal received, check b->running
+            }
             log_error("io_uring_enter failed: %d", rc);
             return rc;
         }

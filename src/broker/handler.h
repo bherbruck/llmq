@@ -284,6 +284,11 @@ INLINE i32 process_mqtt_packet(struct broker *b, struct client_slot *c, const u8
                                       sub_pkt.filters[i].topic.len, sub_pkt.filters[i].qos);
             return_codes[i] = (sub_rc == 0) ? sub_pkt.filters[i].qos : MQTT_SUBACK_FAILURE;
 
+            if (sub_rc != 0) {
+                log_warn("SUBSCRIBE failed slot=%d topic='%.*s'", slot_idx,
+                         (i32)sub_pkt.filters[i].topic.len, (const char *)sub_pkt.filters[i].topic.ptr);
+            }
+
             log_debug("SUBSCRIBE fd=%d slot=%d topic='%.*s' qos=%d granted=%d", c->fd, slot_idx,
                       (i32)sub_pkt.filters[i].topic.len, (const char *)sub_pkt.filters[i].topic.ptr,
                       sub_pkt.filters[i].qos, return_codes[i]);
@@ -330,9 +335,8 @@ INLINE i32 process_mqtt_packet(struct broker *b, struct client_slot *c, const u8
             return -1;
         }
 
-        log_debug("PUBLISH fd=%d slot=%d topic='%.*s' qos=%d len=%u", c->fd, slot_idx,
-                  (i32)pub_pkt.topic.len, (const char *)pub_pkt.topic.ptr, pub_pkt.qos,
-                  pub_pkt.payload_len);
+        log_debug("PUBLISH topic='%.*s' qos=%d", (i32)pub_pkt.topic.len,
+                  (const char *)pub_pkt.topic.ptr, pub_pkt.qos);
 
         // Handle QoS acknowledgment to publisher
         if (pub_pkt.qos == 1) {

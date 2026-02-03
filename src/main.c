@@ -67,6 +67,30 @@ static i32 create_listen_socket(u16 port) {
 }
 
 // =============================================================================
+// Signal Handling
+// =============================================================================
+
+static volatile struct broker *g_broker = NULL;
+
+static void signal_handler(i32 sig) {
+    (void)sig;
+    if (g_broker) {
+        ((struct broker *)g_broker)->running = false;
+    }
+}
+
+static void setup_signals(struct broker *b) {
+    g_broker = b;
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler  = signal_handler;
+    sa.sa_flags    = SA_RESTORER;
+    sa.sa_restorer = sigreturn_trampoline;
+    sys_sigaction(SIGINT, &sa, NULL);
+    sys_sigaction(SIGTERM, &sa, NULL);
+}
+
+// =============================================================================
 // Entry Point
 // =============================================================================
 
@@ -122,13 +146,15 @@ i32 broker_main(i32 argc, char **argv, char **envp) {
 
     log_info("Listening on port %d", cfg.network_port);
 
+    setup_signals(&b);
     rc = broker_run(&b);
 
     sys_close(b.listen_fd);
     ring_cleanup(&b.ring);
     broker_cleanup(&b);
 
-    log_info("Total accepts: %lu, published: %lu", b.accepts, b.msgs_published);
+    log_info("Total accepts: %lu, published: %lu, dropped: %lu", b.accepts, b.msgs_published,
+             b.msgs_dropped);
 
     return rc < 0 ? 1 : 0;
 }

@@ -23,9 +23,14 @@
 #define SYS_setsockopt        54
 #define SYS_exit              60
 #define SYS_fcntl             72
+#define SYS_rt_sigaction      13
 #define SYS_io_uring_setup    425
 #define SYS_io_uring_enter    426
 #define SYS_io_uring_register 427
+
+// Signal numbers
+#define SIGINT  2
+#define SIGTERM 15
 
 // =============================================================================
 // Raw syscall interface
@@ -187,6 +192,26 @@ INLINE i32 sys_listen(i32 fd, i32 backlog) {
 
 INLINE i32 sys_setsockopt(i32 fd, i32 level, i32 optname, const void *optval, u32 optlen) {
     return (i32)syscall5(SYS_setsockopt, fd, level, optname, (i64)optval, optlen);
+}
+
+// Signal handling
+#define SA_RESTORER 0x04000000
+
+struct sigaction {
+    void (*sa_handler)(i32);
+    u64 sa_flags;
+    void (*sa_restorer)(void);
+    u64 sa_mask;
+};
+
+// Signal return trampoline (required for rt_sigaction)
+__attribute__((naked)) static void sigreturn_trampoline(void) {
+    __asm__ volatile("mov $15, %rax\n" // SYS_rt_sigreturn
+                     "syscall\n");
+}
+
+INLINE i32 sys_sigaction(i32 signum, const struct sigaction *act, struct sigaction *oldact) {
+    return (i32)syscall4(SYS_rt_sigaction, signum, (i64)act, (i64)oldact, 8);
 }
 
 // io_uring syscalls

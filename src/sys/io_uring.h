@@ -318,8 +318,9 @@ INLINE void ring_prep_accept_direct(struct io_uring_sqe *sqe, i32 fd, void *addr
     sqe->file_index = IORING_FILE_INDEX_ALLOC;
 }
 
+// Multishot accept without registered files (simpler, works everywhere)
 INLINE void ring_prep_accept_multishot(struct io_uring_sqe *sqe, i32 fd, void *addr, u32 *addrlen) {
-    ring_prep_accept_direct(sqe, fd, addr, addrlen, IORING_ACCEPT_MULTISHOT);
+    ring_prep_accept(sqe, fd, addr, addrlen, IORING_ACCEPT_MULTISHOT);
 }
 
 INLINE void ring_prep_recv(struct io_uring_sqe *sqe, i32 fd, void *buf, u32 len, u32 flags) {
