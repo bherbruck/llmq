@@ -18,19 +18,19 @@
 // =============================================================================
 // FIELD(section, name, type, default, cli_flag, description)
 
-#define BROKER_FIELDS(FIELD)                                                 \
-    /* Network */                                                            \
-    FIELD(network, port, u16, 1883, "port", "Listen port")                   \
-    FIELD(network, backlog, u16, 128, "backlog", "Listen backlog")           \
-    /* Limits */                                                             \
-    FIELD(limits, max_conns, u32, 4096, "max-conns", "Max connections")      \
-    FIELD(limits, max_sessions, u32, 4096, "max-sessions", "Max sessions")   \
-    FIELD(limits, ring_entries, u32, 8192, "ring-entries", "io_uring depth") \
+#define BROKER_FIELDS(FIELD)                                                     \
+    /* Network */                                                                \
+    FIELD(network, port, u16, 1883, "port", "Listen port")                       \
+    FIELD(network, backlog, u16, 128, "backlog", "Listen backlog")               \
+    /* Limits */                                                                 \
+    FIELD(limits, max_conns, u32, 4096, "max-conns", "Max connections")          \
+    FIELD(limits, max_sessions, u32, 4096, "max-sessions", "Max sessions")       \
+    FIELD(limits, ring_entries, u32, 8192, "ring-entries", "io_uring depth")     \
     FIELD(limits, send_pool_mult, u8, 4, "send-pool-mult", "Send bufs per conn") \
-    /* Per-client buffers */                                                 \
-    FIELD(client, max_inflight, u8, 64, "max-inflight", "QoS inflight/client") \
-    FIELD(client, proto_bufs, u8, 16, "proto-bufs", "Protocol buffers/client") \
-    /* Debug */                                                              \
+    /* Per-client buffers */                                                     \
+    FIELD(client, max_inflight, u8, 64, "max-inflight", "QoS inflight/client")   \
+    FIELD(client, proto_bufs, u8, 16, "proto-bufs", "Protocol buffers/client")   \
+    /* Debug */                                                                  \
     FIELD(debug, log_level, u8, 2, "log-level", "Verbosity 0-4")
 
 // =============================================================================

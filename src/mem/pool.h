@@ -12,36 +12,36 @@
 // =============================================================================
 
 struct buf_pool {
-    u8 *buffers;      // mmap'd array of fixed-size buffers
-    u32 *free_stack;  // Stack of free buffer indices
-    u32 buf_size;     // Size of each buffer
-    u32 capacity;     // Total number of buffers
-    u32 free_count;   // Number of free buffers
-    u32 high_water;   // Peak usage (capacity - min(free_count))
+    u8 *buffers;     // mmap'd array of fixed-size buffers
+    u32 *free_stack; // Stack of free buffer indices
+    u32 buf_size;    // Size of each buffer
+    u32 capacity;    // Total number of buffers
+    u32 free_count;  // Number of free buffers
+    u32 high_water;  // Peak usage (capacity - min(free_count))
 };
 
-#define BUF_POOL_INVALID ((u32)-1)
+#define BUF_POOL_INVALID ((u32) - 1)
 
 // Initialize a buffer pool with given capacity and buffer size
 // Returns 0 on success, -1 on failure
 INLINE i32 buf_pool_init(struct buf_pool *p, u32 capacity, u32 buf_size) {
-    p->buf_size = buf_size;
-    p->capacity = capacity;
+    p->buf_size   = buf_size;
+    p->capacity   = capacity;
     p->free_count = capacity;
     p->high_water = 0;
 
     // mmap the buffer array
     usize buffers_size = (usize)capacity * buf_size;
-    p->buffers = (u8 *)sys_mmap(NULL, buffers_size, PROT_READ | PROT_WRITE,
-                                 MAP_PRIVATE | MAP_ANON, -1, 0);
+    p->buffers =
+        (u8 *)sys_mmap(NULL, buffers_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
     if (IS_ERR(p->buffers)) {
         return -1;
     }
 
     // mmap the free stack
     usize stack_size = (usize)capacity * sizeof(u32);
-    p->free_stack = (u32 *)sys_mmap(NULL, stack_size, PROT_READ | PROT_WRITE,
-                                     MAP_PRIVATE | MAP_ANON, -1, 0);
+    p->free_stack =
+        (u32 *)sys_mmap(NULL, stack_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
     if (IS_ERR(p->free_stack)) {
         sys_munmap(p->buffers, buffers_size);
         return -1;
@@ -109,31 +109,30 @@ INLINE u32 buf_pool_used(struct buf_pool *p) {
 // =============================================================================
 
 struct slot_pool {
-    void *slots;       // mmap'd array of fixed-size slots
-    u32 *free_stack;   // Stack of free slot indices
-    u32 slot_size;     // Size of each slot
-    u32 capacity;      // Total number of slots
-    u32 free_count;    // Number of free slots
+    void *slots;     // mmap'd array of fixed-size slots
+    u32 *free_stack; // Stack of free slot indices
+    u32 slot_size;   // Size of each slot
+    u32 capacity;    // Total number of slots
+    u32 free_count;  // Number of free slots
 };
 
-#define SLOT_POOL_INVALID ((u32)-1)
+#define SLOT_POOL_INVALID ((u32) - 1)
 
 // Initialize a slot pool
 INLINE i32 slot_pool_init(struct slot_pool *p, u32 capacity, u32 slot_size) {
-    p->slot_size = slot_size;
-    p->capacity = capacity;
+    p->slot_size  = slot_size;
+    p->capacity   = capacity;
     p->free_count = capacity;
 
     usize slots_size = (usize)capacity * slot_size;
-    p->slots = sys_mmap(NULL, slots_size, PROT_READ | PROT_WRITE,
-                        MAP_PRIVATE | MAP_ANON, -1, 0);
+    p->slots = sys_mmap(NULL, slots_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
     if (IS_ERR(p->slots)) {
         return -1;
     }
 
     usize stack_size = (usize)capacity * sizeof(u32);
-    p->free_stack = (u32 *)sys_mmap(NULL, stack_size, PROT_READ | PROT_WRITE,
-                                     MAP_PRIVATE | MAP_ANON, -1, 0);
+    p->free_stack =
+        (u32 *)sys_mmap(NULL, stack_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
     if (IS_ERR(p->free_stack)) {
         sys_munmap(p->slots, slots_size);
         return -1;

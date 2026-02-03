@@ -39,13 +39,13 @@ enum inflight_state {
 
 // Inflight message entry - metadata only, send buffer is separate
 struct inflight_msg {
-    u16 packet_id;  // MQTT packet identifier
-    u8 state;       // enum inflight_state
-    u8 qos;         // Original QoS level
-    u8 dup_count;   // Retransmission count
-    u8 direction;   // 0 = outgoing (we sent), 1 = incoming (we received)
-    u16 data_len;   // Bytes used in send buffer
-    u32 buf_idx;    // Index into send buffer pool (BUF_POOL_INVALID if none)
+    u16 packet_id; // MQTT packet identifier
+    u8 state;      // enum inflight_state
+    u8 qos;        // Original QoS level
+    u8 dup_count;  // Retransmission count
+    u8 direction;  // 0 = outgoing (we sent), 1 = incoming (we received)
+    u16 data_len;  // Bytes used in send buffer
+    u32 buf_idx;   // Index into send buffer pool (BUF_POOL_INVALID if none)
 };
 
 // =============================================================================
@@ -77,8 +77,8 @@ struct client_slot {
     u8 protocol_version; // 4 = MQTT 3.1.1, 5 = MQTT 5.0
 
     // === Connection (valid when ACTIVE) ===
-    i32 fd;          // Socket fd (-1 when DORMANT/FREE)
-    u16 keepalive;   // Keepalive interval (seconds)
+    i32 fd;        // Socket fd (-1 when DORMANT/FREE)
+    u16 keepalive; // Keepalive interval (seconds)
     u16 _pad1;
     u32 last_active; // Timestamp of last packet
 
@@ -101,9 +101,9 @@ struct client_slot {
     u8 _pad2;
 
     // === QoS 1/2 Inflight tracking (metadata inline, buffers pooled) ===
-    u16 next_packet_id; // Next packet ID to allocate (wraps at 65535)
-    u8 inflight_count;  // Active inflight messages
-    u8 max_inflight;    // Runtime limit for this client
+    u16 next_packet_id;                              // Next packet ID to allocate (wraps at 65535)
+    u8 inflight_count;                               // Active inflight messages
+    u8 max_inflight;                                 // Runtime limit for this client
     struct inflight_msg inflight[LLMQ_MAX_INFLIGHT]; // Small metadata array
 };
 
@@ -259,7 +259,7 @@ INLINE void client_pending_pop(struct client_slot *c) {
 // Allocate inflight slot and send buffer from pool
 // Returns: inflight index (>=0), or error code (<0)
 INLINE i32 client_inflight_alloc(struct client_slot *c, u8 qos, u16 *out_packet_id,
-                                  struct buf_pool *send_pool) {
+                                 struct buf_pool *send_pool) {
     if (c->inflight_count >= c->max_inflight) {
         return INFLIGHT_ERR_CLIENT_FULL;
     }
@@ -362,7 +362,7 @@ INLINE struct inflight_msg *client_inflight_find(struct client_slot *c, u16 pack
 
 // Free inflight entry and return its buffer to pool
 INLINE void client_inflight_free(struct client_slot *c, struct inflight_msg *msg,
-                                  struct buf_pool *send_pool) {
+                                 struct buf_pool *send_pool) {
     if (msg->state != INFLIGHT_FREE) {
         // Return buffer to pool if we have one
         if (msg->buf_idx != BUF_POOL_INVALID && send_pool) {
