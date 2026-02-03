@@ -90,7 +90,8 @@ i32 broker_main(i32 argc, char **argv, char **envp) {
     memset(&b, 0, sizeof(b));
 
     // mmap client slots and fd mapping (max_fds = 2x clients for headroom)
-    rc = broker_init(&b, cfg.limits_max_conns, cfg.limits_max_conns * FD_MULTIPLIER);
+    rc = broker_init(&b, cfg.limits_max_conns, cfg.limits_max_conns * FD_MULTIPLIER,
+                     cfg.client_max_inflight, cfg.client_proto_bufs);
     if (rc < 0) {
         log_error("broker_init failed (mmap): %d", rc);
         return 1;

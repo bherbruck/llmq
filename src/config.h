@@ -11,11 +11,11 @@
 // =============================================================================
 
 #ifndef LLMQ_MAX_CLIENTS
-#define LLMQ_MAX_CLIENTS 1024 // Max array size, runtime can be less
+#define LLMQ_MAX_CLIENTS 4096 // Max array size, runtime can be less
 #endif
 
 #ifndef LLMQ_MAX_FDS
-#define LLMQ_MAX_FDS 4096 // Should be >= 2 * LLMQ_MAX_CLIENTS
+#define LLMQ_MAX_FDS 8192 // Should be >= 2 * LLMQ_MAX_CLIENTS
 #endif
 
 #ifndef LLMQ_LISTEN_BACKLOG
@@ -35,8 +35,27 @@
 #define LLMQ_RECV_BUF_SIZE 65536
 #endif
 
+// Inflight message limits (for QoS tracking and send buffers)
+// Memory per client = MAX_INFLIGHT * SEND_BUF_SIZE
+// With 4096 clients: 4096 * 16 * 4KB = 256MB total
+#ifndef LLMQ_MAX_INFLIGHT
+#define LLMQ_MAX_INFLIGHT 128 // Max capacity for inflight array (runtime can use less)
+#endif
+
+#ifndef LLMQ_SEND_BUF_SIZE
+#define LLMQ_SEND_BUF_SIZE 4096 // 4KB per-inflight send buffer
+#endif
+
+#ifndef LLMQ_PROTO_BUF_SIZE
+#define LLMQ_PROTO_BUF_SIZE 64 // Protocol response buffer (CONNACK, PUBACK, etc.)
+#endif
+
+#ifndef LLMQ_PROTO_BUF_COUNT
+#define LLMQ_PROTO_BUF_COUNT 32 // Max capacity for proto_buf array (runtime can use less)
+#endif
+
 #ifndef LLMQ_PENDING_MSG_DATA
-#define LLMQ_PENDING_MSG_DATA 1024 // 1KB per pending message
+#define LLMQ_PENDING_MSG_DATA 1024 // 1KB per pending message (offline queue)
 #endif
 
 #ifndef LLMQ_MAX_PENDING_MSGS
@@ -79,6 +98,12 @@
 #define LLMQ_MIN_RING_ENTRIES 16
 #define LLMQ_MAX_RING_ENTRIES 32768
 #define LLMQ_MAX_LOG_LEVEL    4
+
+// =============================================================================
+// Event Loop Tuning
+// =============================================================================
+
+#define LLMQ_FLUSH_BATCH_LIMIT 256 // Max CQEs to process when flushing for SQ space
 
 // =============================================================================
 // Numeric Constants

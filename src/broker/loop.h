@@ -13,8 +13,23 @@
 // io_uring Submit Operations
 // =============================================================================
 
-INLINE void submit_accept(struct broker *b) {
+// Get SQE, flushing to kernel if full (simple non-blocking flush)
+// This just pushes pending SQEs to kernel - no CQE processing to avoid recursion
+INLINE struct io_uring_sqe *get_sqe_with_flush(struct broker *b) {
     struct io_uring_sqe *sqe = ring_get_sqe(&b->ring);
+    if (sqe)
+        return sqe;
+
+    // SQ full - flush pending SQEs to kernel (non-blocking)
+    // This lets kernel start processing so SQ head advances
+    ring_submit(&b->ring, 0);
+
+    // Try again
+    return ring_get_sqe(&b->ring);
+}
+
+INLINE void submit_accept(struct broker *b) {
+    struct io_uring_sqe *sqe = get_sqe_with_flush(b);
     if (!sqe) {
         log_error("SQ full, can't submit accept");
         return;
@@ -25,7 +40,7 @@ INLINE void submit_accept(struct broker *b) {
 }
 
 INLINE void submit_recv(struct broker *b, struct client_slot *c) {
-    struct io_uring_sqe *sqe = ring_get_sqe(&b->ring);
+    struct io_uring_sqe *sqe = get_sqe_with_flush(b);
     if (!sqe) {
         log_error("SQ full, can't submit recv");
         return;
@@ -38,7 +53,7 @@ INLINE void submit_recv(struct broker *b, struct client_slot *c) {
 }
 
 INLINE void submit_send(struct broker *b, i32 fd, const u8 *buf, u32 len) {
-    struct io_uring_sqe *sqe = ring_get_sqe(&b->ring);
+    struct io_uring_sqe *sqe = get_sqe_with_flush(b);
     if (!sqe) {
         log_error("SQ full, can't submit send");
         return;
@@ -48,8 +63,20 @@ INLINE void submit_send(struct broker *b, i32 fd, const u8 *buf, u32 len) {
     ring_submit_sqe(&b->ring);
 }
 
+// Submit send with context for tracking inflight buffers
+INLINE void submit_send_ctx(struct broker *b, i32 fd, const u8 *buf, u32 len, u32 ctx) {
+    struct io_uring_sqe *sqe = get_sqe_with_flush(b);
+    if (!sqe) {
+        log_error("SQ full, can't submit send");
+        return;
+    }
+    ring_prep_send(sqe, fd, buf, len, 0);
+    sqe->user_data = make_user_data(OP_SEND, (u32)fd, ctx);
+    ring_submit_sqe(&b->ring);
+}
+
 INLINE void submit_close(struct broker *b, i32 fd) {
-    struct io_uring_sqe *sqe = ring_get_sqe(&b->ring);
+    struct io_uring_sqe *sqe = get_sqe_with_flush(b);
     if (!sqe) {
         log_error("SQ full, can't submit close");
         return;
@@ -155,12 +182,35 @@ INLINE void handle_recv(struct broker *b, struct io_uring_cqe *cqe) {
 }
 
 INLINE void handle_send(struct broker *b, struct io_uring_cqe *cqe) {
-    i32 fd = (i32)ud_fd(cqe->user_data);
+    i32 fd  = (i32)ud_fd(cqe->user_data);
+    u32 ctx = ud_ctx(cqe->user_data);
 
     if (cqe->res < 0) {
-        log_error("send error fd=%d err=%d", fd, cqe->res);
+        log_debug("send error fd=%d err=%d", fd, cqe->res);
+        // Connection broken - close it
+        struct client_slot *c = broker_get_client_by_fd(b, fd);
+        if (c && c->state == CLIENT_ACTIVE) {
+            submit_close(b, fd);
+        }
     } else {
         b->bytes_sent += (u64)cqe->res;
+    }
+
+    // Free inflight buffer for QoS 0 sends (QoS 1/2 wait for ACK)
+    if (ctx != 0) {
+        u32 slot_idx    = send_ctx_slot(ctx);
+        u8 inflight_idx = send_ctx_inflight(ctx);
+        u8 qos          = send_ctx_qos(ctx);
+
+        struct client_slot *c = broker_get_client(b, slot_idx);
+        if (c && inflight_idx < MAX_INFLIGHT) {
+            struct inflight_msg *inf = &c->inflight[inflight_idx];
+            // QoS 0: Free immediately on send complete
+            // QoS 1/2: Buffer stays until PUBACK/PUBCOMP (or send error)
+            if (qos == 0 || cqe->res < 0) {
+                client_inflight_free(c, inf);
+            }
+        }
     }
 }
 

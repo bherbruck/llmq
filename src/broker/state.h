@@ -35,7 +35,8 @@ struct broker {
     u32 max_clients;
     u32 max_fds;
     u16 port;
-    u16 _pad;
+    u8 max_inflight;   // Runtime limit for inflight messages per client
+    u8 proto_buf_count; // Runtime limit for proto_buf slots per client
 
     // Client slots (mmap'd)
     struct client_slot *clients;
@@ -57,17 +58,21 @@ struct broker {
     u64 bytes_recv;
     u64 bytes_sent;
     u64 msgs_published;
+    u64 msgs_dropped; // Dropped due to inflight full
 };
 
 // =============================================================================
 // Broker Initialization
 // =============================================================================
 
-INLINE i32 broker_init(struct broker *b, u32 max_clients, u32 max_fds) {
-    b->max_clients   = max_clients;
-    b->max_fds       = max_fds;
-    b->active_count  = 0;
-    b->dormant_count = 0;
+INLINE i32 broker_init(struct broker *b, u32 max_clients, u32 max_fds, u8 max_inflight,
+                       u8 proto_buf_count) {
+    b->max_clients     = max_clients;
+    b->max_fds         = max_fds;
+    b->max_inflight    = max_inflight;
+    b->proto_buf_count = proto_buf_count;
+    b->active_count    = 0;
+    b->dormant_count   = 0;
 
     // mmap client slots
     usize clients_size = max_clients * sizeof(struct client_slot);
@@ -250,6 +255,33 @@ INLINE u8 ud_op(u64 ud) {
 
 INLINE u32 ud_fd(u64 ud) {
     return (u32)((ud >> UD_FD_SHIFT) & UD_FD_MASK);
+}
+
+#define UD_CTX_MASK 0xFFFFFFFFU
+
+INLINE u32 ud_ctx(u64 ud) {
+    return (u32)(ud & UD_CTX_MASK);
+}
+
+// Context encoding for PUBLISH sends: [16-bit slot][8-bit inflight_idx][8-bit qos]
+#define SEND_CTX_SLOT_SHIFT     16
+#define SEND_CTX_INFLIGHT_SHIFT 8
+#define SEND_CTX_QOS_MASK       0xFFU
+
+INLINE u32 make_send_ctx(u32 slot_idx, u8 inflight_idx, u8 qos) {
+    return (slot_idx << SEND_CTX_SLOT_SHIFT) | ((u32)inflight_idx << SEND_CTX_INFLIGHT_SHIFT) | qos;
+}
+
+INLINE u32 send_ctx_slot(u32 ctx) {
+    return ctx >> SEND_CTX_SLOT_SHIFT;
+}
+
+INLINE u8 send_ctx_inflight(u32 ctx) {
+    return (u8)((ctx >> SEND_CTX_INFLIGHT_SHIFT) & SEND_CTX_QOS_MASK);
+}
+
+INLINE u8 send_ctx_qos(u32 ctx) {
+    return (u8)(ctx & SEND_CTX_QOS_MASK);
 }
 
 #endif // BROKER_STATE_H

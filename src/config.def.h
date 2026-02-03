@@ -18,15 +18,18 @@
 // =============================================================================
 // FIELD(section, name, type, default, cli_flag, description)
 
-#define BROKER_FIELDS(FIELD)                                                \
-    /* Network */                                                           \
-    FIELD(network, port, u16, 1883, "port", "Listen port")                  \
-    FIELD(network, backlog, u16, 128, "backlog", "Listen backlog")          \
-    /* Limits */                                                            \
-    FIELD(limits, max_conns, u32, 1024, "max-conns", "Max connections")     \
-    FIELD(limits, max_sessions, u32, 1024, "max-sessions", "Max sessions")  \
-    FIELD(limits, ring_entries, u32, 256, "ring-entries", "io_uring depth") \
-    /* Debug */                                                             \
+#define BROKER_FIELDS(FIELD)                                                 \
+    /* Network */                                                            \
+    FIELD(network, port, u16, 1883, "port", "Listen port")                   \
+    FIELD(network, backlog, u16, 128, "backlog", "Listen backlog")           \
+    /* Limits */                                                             \
+    FIELD(limits, max_conns, u32, 4096, "max-conns", "Max connections")      \
+    FIELD(limits, max_sessions, u32, 4096, "max-sessions", "Max sessions")   \
+    FIELD(limits, ring_entries, u32, 8192, "ring-entries", "io_uring depth") \
+    /* Per-client buffers */                                                 \
+    FIELD(client, max_inflight, u8, 64, "max-inflight", "QoS inflight/client") \
+    FIELD(client, proto_bufs, u8, 16, "proto-bufs", "Protocol buffers/client") \
+    /* Debug */                                                              \
     FIELD(debug, log_level, u8, 2, "log-level", "Verbosity 0-4")
 
 // =============================================================================
@@ -58,6 +61,11 @@ INLINE i32 broker_config_parse(i32 argc, char **argv, char **envp, struct broker
         return -1;
     if (cfg->limits_ring_entries < LLMQ_MIN_RING_ENTRIES ||
         cfg->limits_ring_entries > LLMQ_MAX_RING_ENTRIES)
+        return -1;
+    // Per-client buffer limits must fit in compile-time array sizes
+    if (cfg->client_max_inflight == 0 || cfg->client_max_inflight > LLMQ_MAX_INFLIGHT)
+        return -1;
+    if (cfg->client_proto_bufs == 0 || cfg->client_proto_bufs > LLMQ_PROTO_BUF_COUNT)
         return -1;
     if (cfg->debug_log_level > LLMQ_MAX_LOG_LEVEL)
         return -1;
