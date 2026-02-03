@@ -217,14 +217,11 @@ INLINE void handle_send(struct broker *b, struct io_uring_cqe *cqe) {
 INLINE void handle_close(struct broker *b, struct io_uring_cqe *cqe) {
     i32 fd = (i32)ud_fd(cqe->user_data);
 
-    if (cqe->res < 0) {
-        log_error("close error fd=%d err=%d", fd, cqe->res);
-    }
-
     // Find slot and handle disconnect
     struct client_slot *c = broker_get_client_by_fd(b, fd);
     if (c) {
         i32 slot_idx = b->fd_to_slot[fd];
+        log_debug("client disconnected fd=%d slot=%d", fd, slot_idx);
         if (c->clean_session) {
             broker_free_slot(b, (u32)slot_idx);
         } else {
