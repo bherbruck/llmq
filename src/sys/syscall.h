@@ -118,9 +118,10 @@ INLINE i64 syscall6(i64 n, i64 a1, i64 a2, i64 a3, i64 a4, i64 a5, i64 a6) {
 #define EINVAL     22
 #define ENOSPC     28
 #define EPIPE      32
-#define ENOTSOCK   88
-#define ECONNRESET 104
-#define ETIMEDOUT  110
+#define ENOTSOCK    88
+#define EADDRINUSE  98
+#define ECONNRESET  104
+#define ETIMEDOUT   110
 
 // =============================================================================
 // Wrapped syscalls
@@ -195,7 +196,8 @@ INLINE i32 sys_setsockopt(i32 fd, i32 level, i32 optname, const void *optval, u3
 }
 
 // Signal handling
-#define SA_RESTORER 0x04000000
+#define SA_RESTORER   0x04000000
+#define SIGSET_SIZE   8 // sizeof(sigset_t) on x86_64
 
 struct sigaction {
     void (*sa_handler)(i32);
@@ -211,7 +213,7 @@ __attribute__((naked)) static void sigreturn_trampoline(void) {
 }
 
 INLINE i32 sys_sigaction(i32 signum, const struct sigaction *act, struct sigaction *oldact) {
-    return (i32)syscall4(SYS_rt_sigaction, signum, (i64)act, (i64)oldact, 8);
+    return (i32)syscall4(SYS_rt_sigaction, signum, (i64)act, (i64)oldact, SIGSET_SIZE);
 }
 
 // io_uring syscalls

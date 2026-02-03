@@ -14,17 +14,14 @@
 // =============================================================================
 
 // Get SQE, flushing to kernel if full (simple non-blocking flush)
-// This just pushes pending SQEs to kernel - no CQE processing to avoid recursion
 INLINE struct io_uring_sqe *get_sqe_with_flush(struct broker *b) {
     struct io_uring_sqe *sqe = ring_get_sqe(&b->ring);
     if (sqe)
         return sqe;
 
     // SQ full - flush pending SQEs to kernel (non-blocking)
-    // This lets kernel start processing so SQ head advances
     ring_submit(&b->ring, 0);
 
-    // Try again
     return ring_get_sqe(&b->ring);
 }
 
@@ -45,8 +42,13 @@ INLINE void submit_recv(struct broker *b, struct client_slot *c) {
         log_error("SQ full, can't submit recv");
         return;
     }
-    u8 *buf   = c->recv_buf + c->recv_len;
-    u32 space = RECV_BUF_SIZE - c->recv_len;
+    u8 *recv_buf = client_recv_buf(c, &b->recv_pool);
+    if (!recv_buf) {
+        log_error("No recv buffer for fd=%d", c->fd);
+        return;
+    }
+    u8 *buf   = recv_buf + c->recv_len;
+    u32 space = b->recv_pool.buf_size - c->recv_len;
     ring_prep_recv(sqe, c->fd, buf, space, 0);
     sqe->user_data = make_user_data(OP_RECV, (u32)c->fd, 0);
     ring_submit_sqe(&b->ring);
@@ -127,8 +129,13 @@ INLINE void handle_accept(struct broker *b, struct io_uring_cqe *cqe) {
 }
 
 INLINE void process_recv_buffer(struct broker *b, struct client_slot *c) {
+    u8 *recv_buf = client_recv_buf(c, &b->recv_pool);
+    if (!recv_buf) {
+        return;
+    }
+
     while (c->recv_len > 0) {
-        i32 packet_len = mqtt_packet_complete(c->recv_buf, c->recv_len);
+        i32 packet_len = mqtt_packet_complete(recv_buf, c->recv_len);
 
         if (packet_len == MQTT_INCOMPLETE) {
             break;
@@ -140,13 +147,13 @@ INLINE void process_recv_buffer(struct broker *b, struct client_slot *c) {
             return;
         }
 
-        i32 consumed = process_mqtt_packet(b, c, c->recv_buf, (u32)packet_len);
+        i32 consumed = process_mqtt_packet(b, c, recv_buf, (u32)packet_len);
 
         if (consumed < 0) {
             // Negative return = close connection
             // Only warn if it wasn't a clean DISCONNECT (type=14)
             struct mqtt_fixed_header hdr;
-            mqtt_parse_fixed_header(c->recv_buf, c->recv_len, &hdr);
+            mqtt_parse_fixed_header(recv_buf, c->recv_len, &hdr);
             if (hdr.type != MQTT_DISCONNECT) {
                 log_warn("Packet error fd=%d type=%d, closing", c->fd, hdr.type);
             }
@@ -156,7 +163,7 @@ INLINE void process_recv_buffer(struct broker *b, struct client_slot *c) {
 
         u32 remaining = c->recv_len - (u32)consumed;
         if (remaining > 0) {
-            memmove(c->recv_buf, c->recv_buf + consumed, remaining);
+            memmove(recv_buf, recv_buf + consumed, remaining);
         }
         c->recv_len = remaining;
     }
@@ -212,12 +219,12 @@ INLINE void handle_send(struct broker *b, struct io_uring_cqe *cqe) {
         u8 qos          = send_ctx_qos(ctx);
 
         struct client_slot *c = broker_get_client(b, slot_idx);
-        if (c && inflight_idx < MAX_INFLIGHT) {
+        if (c && inflight_idx < c->max_inflight) {
             struct inflight_msg *inf = &c->inflight[inflight_idx];
             // QoS 0: Free immediately on send complete
             // QoS 1/2: Buffer stays until PUBACK/PUBCOMP (or send error)
             if (qos == 0 || cqe->res < 0) {
-                client_inflight_free(c, inf);
+                client_inflight_free(c, inf, &b->send_pool);
             }
         }
     }

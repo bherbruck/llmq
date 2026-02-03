@@ -39,31 +39,36 @@ static i32 forward_publish_to_client(struct broker *b, u32 slot_idx, struct clie
 
     // ALL sends use inflight buffer to avoid use-after-free with async io_uring
     u16 packet_id = 0;
-    i32 inf_idx;
-
-    if (effective_qos == 0) {
-        // QoS 0: Allocate inflight slot for buffer only (no state tracking)
-        inf_idx = client_inflight_alloc(c, 0, &packet_id, b->max_inflight);
-    } else {
-        // QoS 1/2: Allocate with state tracking
-        inf_idx = client_inflight_alloc(c, effective_qos, &packet_id, b->max_inflight);
-    }
+    i32 inf_idx   = client_inflight_alloc(c, effective_qos, &packet_id, &b->send_pool);
 
     if (inf_idx < 0) {
         b->msgs_dropped++;
+        if (inf_idx == INFLIGHT_ERR_CLIENT_FULL) {
+            b->drops_inflight_full++;
+        } else if (inf_idx == INFLIGHT_ERR_POOL_EMPTY) {
+            b->drops_pool_empty++;
+        }
         return -1;
     }
 
     struct inflight_msg *inf = &c->inflight[inf_idx];
+
+    // Get send buffer from pool
+    u8 *send_buf = client_inflight_buffer(inf, &b->send_pool);
+    if (!send_buf) {
+        client_inflight_free(c, inf, &b->send_pool);
+        log_debug("No send buffer for inflight fd=%d", c->fd);
+        return -1;
+    }
 
     // Encode into inflight buffer (persists until send CQE for QoS 0, ACK for QoS 1/2)
     struct mqtt_publish fwd = *pub;
     fwd.qos                 = effective_qos;
     fwd.dup                 = false;
 
-    u32 fwd_len = mqtt_encode_publish(inf->send_buf, &fwd, packet_id);
-    if (fwd_len > SEND_BUF_SIZE) {
-        client_inflight_free(c, inf);
+    u32 fwd_len = mqtt_encode_publish(send_buf, &fwd, packet_id);
+    if (fwd_len > b->send_pool.buf_size) {
+        client_inflight_free(c, inf, &b->send_pool);
         log_debug("Message too large for inflight buffer fd=%d", c->fd);
         return -1;
     }
@@ -71,7 +76,7 @@ static i32 forward_publish_to_client(struct broker *b, u32 slot_idx, struct clie
 
     // Submit with context so handle_send can free buffer
     u32 ctx = make_send_ctx(slot_idx, (u8)inf_idx, effective_qos);
-    submit_send_ctx(b, c->fd, inf->send_buf, fwd_len, ctx);
+    submit_send_ctx(b, c->fd, send_buf, fwd_len, ctx);
 
     if (effective_qos > 0) {
         log_debug("  -> fd=%d qos=%d pkt_id=%d", c->fd, effective_qos, packet_id);
@@ -139,7 +144,6 @@ INLINE i32 process_mqtt_packet(struct broker *b, struct client_slot *c, const u8
     switch (hdr.type) {
     case MQTT_CONNECT: {
         if (c->state != CLIENT_ACTIVE || c->protocol_version != 0) {
-            // Already connected or not in right state
             return -1;
         }
 
@@ -154,13 +158,10 @@ INLINE i32 process_mqtt_packet(struct broker *b, struct client_slot *c, const u8
             return -1;
         }
 
-        // Set client identity and mark as connected
         client_set_identity(c, conn_pkt.client_id.ptr, (u8)conn_pkt.client_id.len);
-        c->protocol_version = conn_pkt.protocol_version; // 4 = MQTT 3.1.1
+        c->protocol_version = conn_pkt.protocol_version;
         c->keepalive        = conn_pkt.keepalive;
         c->clean_session    = conn_pkt.clean_session;
-
-        // TODO: Check for existing session with same client_id (session takeover)
 
         log_debug("CONNECT fd=%d slot=%d client='%.*s' keepalive=%d", c->fd, slot_idx,
                   (i32)c->client_id_len, c->client_id, c->keepalive);
@@ -173,7 +174,7 @@ INLINE i32 process_mqtt_packet(struct broker *b, struct client_slot *c, const u8
 
     case MQTT_PINGREQ: {
         if (c->protocol_version == 0) {
-            return -1; // Not connected
+            return -1;
         }
         log_trace("PINGREQ fd=%d", c->fd);
         u8 *pbuf = client_get_proto_buf(c, b->proto_buf_count);
@@ -189,7 +190,6 @@ INLINE i32 process_mqtt_packet(struct broker *b, struct client_slot *c, const u8
     }
 
     case MQTT_PUBACK: {
-        // Subscriber acknowledged a QoS 1 message we sent
         if (var_len < 2) {
             return -1;
         }
@@ -197,7 +197,7 @@ INLINE i32 process_mqtt_packet(struct broker *b, struct client_slot *c, const u8
         struct inflight_msg *inf = client_inflight_find(c, packet_id);
         if (inf && inf->state == INFLIGHT_WAIT_PUBACK) {
             log_debug("PUBACK fd=%d packet_id=%d - delivery complete", c->fd, packet_id);
-            client_inflight_free(c, inf);
+            client_inflight_free(c, inf, &b->send_pool);
         } else {
             log_debug("PUBACK fd=%d packet_id=%d - unexpected", c->fd, packet_id);
         }
@@ -205,7 +205,6 @@ INLINE i32 process_mqtt_packet(struct broker *b, struct client_slot *c, const u8
     }
 
     case MQTT_PUBREC: {
-        // QoS 2: We sent PUBLISH, client sends PUBREC, we send PUBREL
         if (var_len < 2) {
             return -1;
         }
@@ -213,16 +212,19 @@ INLINE i32 process_mqtt_packet(struct broker *b, struct client_slot *c, const u8
         struct inflight_msg *inf = client_inflight_find(c, packet_id);
         if (inf && inf->state == INFLIGHT_WAIT_PUBREC) {
             log_debug("PUBREC fd=%d packet_id=%d - sending PUBREL", c->fd, packet_id);
-            // Transition to WAIT_PUBCOMP, send PUBREL
             inf->state = INFLIGHT_WAIT_PUBCOMP;
-            u8 pubrel[MQTT_PUBREL_SIZE];
-            mqtt_encode_pubrel(pubrel, packet_id);
-            // Encode into inflight buffer for persistence
-            for (u32 i = 0; i < MQTT_PUBREL_SIZE; i++) {
-                inf->send_buf[i] = pubrel[i];
+
+            // Get send buffer and encode PUBREL
+            u8 *send_buf = client_inflight_buffer(inf, &b->send_pool);
+            if (send_buf) {
+                u8 pubrel[MQTT_PUBREL_SIZE];
+                mqtt_encode_pubrel(pubrel, packet_id);
+                for (u32 i = 0; i < MQTT_PUBREL_SIZE; i++) {
+                    send_buf[i] = pubrel[i];
+                }
+                inf->data_len = MQTT_PUBREL_SIZE;
+                submit_send(b, c->fd, send_buf, MQTT_PUBREL_SIZE);
             }
-            inf->data_len = MQTT_PUBREL_SIZE;
-            submit_send(b, c->fd, inf->send_buf, MQTT_PUBREL_SIZE);
         } else {
             log_debug("PUBREC fd=%d packet_id=%d - unexpected", c->fd, packet_id);
         }
@@ -230,8 +232,6 @@ INLINE i32 process_mqtt_packet(struct broker *b, struct client_slot *c, const u8
     }
 
     case MQTT_PUBREL: {
-        // QoS 2: Client sent PUBLISH, we sent PUBREC, client sends PUBREL
-        // Now we deliver and send PUBCOMP
         if (var_len < 2) {
             return -1;
         }
@@ -239,11 +239,10 @@ INLINE i32 process_mqtt_packet(struct broker *b, struct client_slot *c, const u8
         struct inflight_msg *inf = client_inflight_find(c, packet_id);
         if (inf && inf->state == INFLIGHT_WAIT_PUBREL && inf->direction == 1) {
             log_debug("PUBREL fd=%d packet_id=%d - sending PUBCOMP", c->fd, packet_id);
-            client_inflight_free(c, inf);
+            client_inflight_free(c, inf, &b->send_pool);
         } else {
             log_debug("PUBREL fd=%d packet_id=%d - sending PUBCOMP (no state)", c->fd, packet_id);
         }
-        // Send PUBCOMP
         u8 *pbuf = client_get_proto_buf(c, b->proto_buf_count);
         mqtt_encode_pubcomp(pbuf, packet_id);
         submit_send(b, c->fd, pbuf, MQTT_PUBCOMP_SIZE);
@@ -251,8 +250,6 @@ INLINE i32 process_mqtt_packet(struct broker *b, struct client_slot *c, const u8
     }
 
     case MQTT_PUBCOMP: {
-        // QoS 2: We sent PUBLISH → got PUBREC → sent PUBREL → got PUBCOMP
-        // Delivery complete
         if (var_len < 2) {
             return -1;
         }
@@ -260,7 +257,7 @@ INLINE i32 process_mqtt_packet(struct broker *b, struct client_slot *c, const u8
         struct inflight_msg *inf = client_inflight_find(c, packet_id);
         if (inf && inf->state == INFLIGHT_WAIT_PUBCOMP) {
             log_debug("PUBCOMP fd=%d packet_id=%d - delivery complete", c->fd, packet_id);
-            client_inflight_free(c, inf);
+            client_inflight_free(c, inf, &b->send_pool);
         } else {
             log_debug("PUBCOMP fd=%d packet_id=%d - unexpected", c->fd, packet_id);
         }
@@ -269,7 +266,7 @@ INLINE i32 process_mqtt_packet(struct broker *b, struct client_slot *c, const u8
 
     case MQTT_SUBSCRIBE: {
         if (c->protocol_version == 0) {
-            return -1; // Not connected
+            return -1;
         }
 
         struct mqtt_subscribe sub_pkt;
@@ -302,7 +299,7 @@ INLINE i32 process_mqtt_packet(struct broker *b, struct client_slot *c, const u8
 
     case MQTT_UNSUBSCRIBE: {
         if (c->protocol_version == 0) {
-            return -1; // Not connected
+            return -1;
         }
 
         struct mqtt_unsubscribe unsub_pkt;
@@ -326,7 +323,7 @@ INLINE i32 process_mqtt_packet(struct broker *b, struct client_slot *c, const u8
 
     case MQTT_PUBLISH: {
         if (c->protocol_version == 0) {
-            return -1; // Not connected
+            return -1;
         }
 
         struct mqtt_publish pub_pkt;
@@ -338,39 +335,32 @@ INLINE i32 process_mqtt_packet(struct broker *b, struct client_slot *c, const u8
         log_debug("PUBLISH topic='%.*s' qos=%d", (i32)pub_pkt.topic.len,
                   (const char *)pub_pkt.topic.ptr, pub_pkt.qos);
 
-        // Handle QoS acknowledgment to publisher
         if (pub_pkt.qos == 1) {
-            // QoS 1: Send PUBACK immediately
             u8 *pbuf = client_get_proto_buf(c, b->proto_buf_count);
             mqtt_encode_puback(pbuf, pub_pkt.packet_id);
             submit_send(b, c->fd, pbuf, MQTT_PUBACK_SIZE);
         } else if (pub_pkt.qos == 2) {
-            // QoS 2: Check if this is a duplicate (DUP=1)
             struct inflight_msg *existing = client_inflight_find(c, pub_pkt.packet_id);
             if (existing && existing->direction == 1) {
-                // Duplicate - resend PUBREC but don't re-deliver
                 log_debug("PUBLISH fd=%d qos=2 pkt_id=%d DUP - resending PUBREC", c->fd,
                           pub_pkt.packet_id);
                 u8 *pbuf = client_get_proto_buf(c, b->proto_buf_count);
                 mqtt_encode_pubrec(pbuf, pub_pkt.packet_id);
                 submit_send(b, c->fd, pbuf, MQTT_PUBREC_SIZE);
-                break; // Don't fan out again
+                break;
             }
 
-            // Track this message for QoS 2 flow
             i32 inf_idx = client_inflight_track_incoming(c, pub_pkt.packet_id);
             if (inf_idx < 0) {
                 log_debug("PUBLISH fd=%d qos=2 - inflight full, dropping", c->fd);
                 return -1;
             }
 
-            // Send PUBREC to publisher
             u8 *pbuf = client_get_proto_buf(c, b->proto_buf_count);
             mqtt_encode_pubrec(pbuf, pub_pkt.packet_id);
             submit_send(b, c->fd, pbuf, MQTT_PUBREC_SIZE);
         }
 
-        // Fan out to matching subscribers via trie
         struct publish_ctx pctx;
         pctx.broker = b;
         pctx.pub    = &pub_pkt;

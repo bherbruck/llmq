@@ -113,10 +113,12 @@
 #define FD_STDOUT 1
 #define FD_STDERR 2
 
-#define FD_MULTIPLIER 2 // max_fds = max_clients * FD_MULTIPLIER
-#define BITS_PER_BYTE 8
-#define BYTE_MASK     0xFF
-#define KB_DIVISOR    1024
+#define FD_MULTIPLIER      2 // max_fds = max_clients * FD_MULTIPLIER
+#define BITS_PER_BYTE      8
+#define BYTE_MASK          0xFF
+#define KB_DIVISOR         1024
+#define MB_DIVISOR         (1024ULL * 1024)
+#define PERCENT_MULTIPLIER 100
 
 #define DECIMAL_BASE     10
 #define HEX_BASE         16

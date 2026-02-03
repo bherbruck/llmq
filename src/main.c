@@ -33,6 +33,8 @@ static i32 create_listen_socket(u16 port) {
         return fd;
     }
 
+    // SO_REUSEADDR: allow quick restart after clean shutdown (TIME_WAIT)
+    // We intentionally do NOT set SO_REUSEPORT - only one broker per port
     i32 optval = 1;
     i32 rc     = sys_setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval));
     if (rc < 0) {
@@ -40,8 +42,6 @@ static i32 create_listen_socket(u16 port) {
         sys_close(fd);
         return rc;
     }
-
-    sys_setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &optval, sizeof(optval));
 
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
@@ -51,12 +51,16 @@ static i32 create_listen_socket(u16 port) {
 
     rc = sys_bind(fd, &addr, sizeof(addr));
     if (rc < 0) {
-        log_error("bind() failed: %d", rc);
+        if (rc == -EADDRINUSE) {
+            log_error("Port %d already in use (another broker running?)", port);
+        } else {
+            log_error("bind() failed: %d", rc);
+        }
         sys_close(fd);
         return rc;
     }
 
-    rc = sys_listen(fd, DEFAULT_LISTEN_BACKLOG);
+    rc = sys_listen(fd, LLMQ_LISTEN_BACKLOG);
     if (rc < 0) {
         log_error("listen() failed: %d", rc);
         sys_close(fd);
@@ -114,16 +118,23 @@ i32 broker_main(i32 argc, char **argv, char **envp) {
     memset(&b, 0, sizeof(b));
 
     // mmap client slots and fd mapping (max_fds = 2x clients for headroom)
+    // Send pool: configurable buffers per client (shared pool for all inflight)
+    u32 send_pool_count = cfg.limits_max_conns * cfg.limits_send_pool_mult;
     rc = broker_init(&b, cfg.limits_max_conns, cfg.limits_max_conns * FD_MULTIPLIER,
-                     cfg.client_max_inflight, cfg.client_proto_bufs);
+                     cfg.client_max_inflight, cfg.client_proto_bufs, LLMQ_RECV_BUF_SIZE,
+                     LLMQ_SEND_BUF_SIZE, send_pool_count);
     if (rc < 0) {
         log_error("broker_init failed (mmap): %d", rc);
         return 1;
     }
     b.port = cfg.network_port;
 
-    log_info("Allocated %d client slots (%lu KB)", cfg.limits_max_conns,
-             (cfg.limits_max_conns * sizeof(struct client_slot)) / KB_DIVISOR);
+    // Calculate actual memory usage from pools
+    u64 client_mem = (u64)cfg.limits_max_conns * sizeof(struct client_slot);
+    u64 recv_mem   = (u64)cfg.limits_max_conns * LLMQ_RECV_BUF_SIZE;
+    u64 send_mem   = (u64)send_pool_count * LLMQ_SEND_BUF_SIZE;
+    log_info("Memory: clients=%lu KB, recv_pool=%lu MB, send_pool=%lu MB", client_mem / KB_DIVISOR,
+             recv_mem / MB_DIVISOR, send_mem / MB_DIVISOR);
 
     log_info("Initializing io_uring with %d entries...", cfg.limits_ring_entries);
 
@@ -153,8 +164,15 @@ i32 broker_main(i32 argc, char **argv, char **envp) {
     ring_cleanup(&b.ring);
     broker_cleanup(&b);
 
-    log_info("Total accepts: %lu, published: %lu, dropped: %lu", b.accepts, b.msgs_published,
-             b.msgs_dropped);
+    log_info("Stats: accepts=%lu published=%lu", b.accepts, b.msgs_published);
+    u32 send_pct =
+        b.send_pool.capacity > 0 ? (b.send_pool.high_water * PERCENT_MULTIPLIER) / b.send_pool.capacity : 0;
+    log_info("Pools: send=%u/%u (%u%% peak), recv=%u/%u", b.send_pool.high_water,
+             b.send_pool.capacity, send_pct, b.recv_pool.high_water, b.recv_pool.capacity);
+    if (b.msgs_dropped > 0) {
+        log_info("Drops: %lu total (inflight_full=%lu, pool_empty=%lu)", b.msgs_dropped,
+                 b.drops_inflight_full, b.drops_pool_empty);
+    }
 
     return rc < 0 ? 1 : 0;
 }
