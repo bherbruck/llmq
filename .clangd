@@ -20,9 +20,10 @@ CompileFlags:
 
 Diagnostics:
   ClangTidy:
-    Add: ['*']
-  UnusedIncludes: Strict
-  MissingIncludes: Strict
+    Add: []
+    Remove: []
+  UnusedIncludes: None
+  MissingIncludes: None
 
 InlayHints:
   Enabled: true

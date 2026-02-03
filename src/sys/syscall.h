@@ -12,6 +12,7 @@
 
 #define SYS_read              0
 #define SYS_write             1
+#define SYS_open              2
 #define SYS_close             3
 #define SYS_mmap              9
 #define SYS_munmap            11
@@ -135,6 +136,18 @@ INLINE i64 sys_write(i32 fd, const void *buf, usize count) {
 
 INLINE i32 sys_close(i32 fd) {
     return (i32)syscall1(SYS_close, fd);
+}
+
+// open flags
+#define O_RDONLY 0
+#define O_WRONLY 1
+#define O_RDWR   2
+#define O_CREAT  0100
+#define O_TRUNC  01000
+#define O_APPEND 02000
+
+INLINE i32 sys_open(const char *path, i32 flags, i32 mode) {
+    return (i32)syscall3(SYS_open, (i64)path, flags, mode);
 }
 
 // mmap flags

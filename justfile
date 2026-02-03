@@ -14,7 +14,7 @@ bindir := "bin"
 out := bindir / "broker"
 
 # Source files
-sources := srcdir / "main.c " + srcdir / "sys/io_uring.c"
+sources := srcdir / "main.c " + srcdir / "sys/io_uring.c " + srcdir / "mem/string.c"
 
 # Base compiler flags
 cflags := "-std=c11 -Wall -Wextra -Wpedantic -Wno-unused-function -ffreestanding -nostdlib -fno-stack-protector -fno-pic -fno-builtin -I" + srcdir
@@ -72,11 +72,22 @@ check: lint analyze build
 watch:
     watchexec -e c,h just build
 
-# Generate compile_commands.json for LSP
+# Generate compile_commands.json for LSP (includes test files)
 compile-commands: _bindir
-    {{cc}} {{cflags}} {{clang_flags}} -MJ {{bindir}}/compile_commands.json -o /dev/null {{srcdir}}/main.c 2>/dev/null || true
+    #!/usr/bin/env bash
     echo "[" > compile_commands.json
-    cat {{bindir}}/compile_commands.json >> compile_commands.json
+    first=1
+    # Main sources
+    for f in {{sources}}; do
+        [ $first -eq 0 ] && echo "," >> compile_commands.json
+        first=0
+        echo '  {"directory": "'$(pwd)'", "file": "'$f'", "command": "{{cc}} {{cflags}} -c '$f'"}' >> compile_commands.json
+    done
+    # Test files
+    for f in $(find src -name '*.test.c'); do
+        echo "," >> compile_commands.json
+        echo '  {"directory": "'$(pwd)'", "file": "'$f'", "command": "{{cc}} {{cflags}} -c '$f'"}' >> compile_commands.json
+    done
     echo "]" >> compile_commands.json
     @echo "Generated compile_commands.json"
 
@@ -106,6 +117,20 @@ info: build
 # Disassemble hot functions
 disasm: build
     objdump -d {{out}} | less
+
+# === Testing ===
+
+# Run all tests (*.test.c files)
+test: _bindir
+    #!/usr/bin/env bash
+    echo "Finding tests..."
+    for f in $(find src -name '*.test.c'); do
+        name=$(basename "$f" .test.c)
+        echo -e "\n=== $name ==="
+        {{cc}} {{cflags}} {{clang_flags}} -Wno-unused-function -o {{bindir}}/test-$name "$f" {{srcdir}}/mem/string.c || exit 1
+        ./{{bindir}}/test-$name || exit 1
+    done
+    echo -e "\n=== All tests passed ==="
 
 # Clean build artifacts
 clean:

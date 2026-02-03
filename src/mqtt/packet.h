@@ -40,6 +40,36 @@ enum mqtt_parse_result {
 };
 
 // =============================================================================
+// Protocol Constants
+// =============================================================================
+
+// Fixed header masks
+#define MQTT_TYPE_SHIFT 4    // Packet type in upper nibble
+#define MQTT_FLAGS_MASK 0x0F // Flags in lower nibble
+
+// Variable Byte Integer (VBI) encoding
+#define MQTT_VBI_CONTINUE  0x80 // MSB set = more bytes follow
+#define MQTT_VBI_MASK      0x7F // Lower 7 bits = value
+#define MQTT_VBI_SHIFT     7    // Bits per VBI byte
+#define MQTT_VBI_MAX_BYTES 4    // Max VBI length
+
+// VBI max values per byte count (for size calculation)
+#define MQTT_VBI_1BYTE_MAX 127     // 2^7 - 1
+#define MQTT_VBI_2BYTE_MAX 16383   // 2^14 - 1
+#define MQTT_VBI_3BYTE_MAX 2097151 // 2^21 - 1
+
+// Big-endian u16 encoding
+#define MQTT_U16_HIGH_SHIFT 8    // Shift for high byte
+#define MQTT_U16_LOW_MASK   0xFF // Mask for low byte
+
+// Packet ID constants
+#define MQTT_PACKET_ID_SIZE 2 // Packet ID is always 2 bytes
+
+// String encoding
+#define MQTT_STR_LEN_BYTES 2 // 2-byte big-endian length prefix
+#define MQTT_STR_LEN_SHIFT 8 // Shift for high byte
+
+// =============================================================================
 // Zero-Copy String Slice
 // =============================================================================
 
@@ -67,8 +97,8 @@ INLINE i32 mqtt_parse_fixed_header(const u8 *buf, u32 len, struct mqtt_fixed_hea
         return MQTT_INCOMPLETE;
     }
 
-    hdr->type  = buf[0] >> 4;
-    hdr->flags = buf[0] & 0x0F;
+    hdr->type  = buf[0] >> MQTT_TYPE_SHIFT;
+    hdr->flags = buf[0] & MQTT_FLAGS_MASK;
 
     // Parse variable byte integer (remaining length)
     u32 value      = 0;
@@ -79,15 +109,15 @@ INLINE i32 mqtt_parse_fixed_header(const u8 *buf, u32 len, struct mqtt_fixed_hea
         if (pos >= len) {
             return MQTT_INCOMPLETE;
         }
-        if (pos > 4) {
+        if (pos > MQTT_VBI_MAX_BYTES) {
             return MQTT_ERR_MALFORMED; // VBI too long
         }
 
         u8 byte = buf[pos++];
-        value += (byte & 0x7F) * multiplier;
-        multiplier *= 128;
+        value += (byte & MQTT_VBI_MASK) * multiplier;
+        multiplier <<= MQTT_VBI_SHIFT;
 
-        if ((byte & 0x80) == 0) {
+        if ((byte & MQTT_VBI_CONTINUE) == 0) {
             break;
         }
     }
@@ -121,20 +151,20 @@ INLINE i32 mqtt_packet_complete(const u8 *buf, u32 len) {
 // Parse MQTT string: 2-byte big-endian length + data
 // Returns: bytes consumed on success, or mqtt_parse_result on error
 INLINE i32 mqtt_parse_string(const u8 *buf, u32 remaining, struct mqtt_str *str) {
-    if (remaining < 2) {
+    if (remaining < MQTT_STR_LEN_BYTES) {
         return MQTT_INCOMPLETE;
     }
 
-    u16 slen = ((u16)buf[0] << 8) | buf[1];
+    u16 slen = (u16)((buf[0] << MQTT_STR_LEN_SHIFT) | buf[1]);
 
-    if (remaining < 2u + slen) {
+    if (remaining < MQTT_STR_LEN_BYTES + slen) {
         return MQTT_INCOMPLETE;
     }
 
-    str->ptr = buf + 2;
+    str->ptr = buf + MQTT_STR_LEN_BYTES;
     str->len = slen;
 
-    return 2 + slen;
+    return MQTT_STR_LEN_BYTES + slen;
 }
 
 // =============================================================================
@@ -151,7 +181,7 @@ INLINE i32 mqtt_parse_binary(const u8 *buf, u32 remaining, struct mqtt_str *data
 // =============================================================================
 
 INLINE u16 mqtt_read_u16(const u8 *buf) {
-    return ((u16)buf[0] << 8) | buf[1];
+    return (u16)((buf[0] << MQTT_STR_LEN_SHIFT) | buf[1]);
 }
 
 // =============================================================================
@@ -163,10 +193,10 @@ INLINE u16 mqtt_read_u16(const u8 *buf) {
 INLINE u32 mqtt_encode_remaining_len(u8 *buf, u32 len) {
     u32 pos = 0;
     do {
-        u8 byte = len & 0x7F;
-        len >>= 7;
+        u8 byte = len & MQTT_VBI_MASK;
+        len >>= MQTT_VBI_SHIFT;
         if (len > 0) {
-            byte |= 0x80;
+            byte |= MQTT_VBI_CONTINUE;
         }
         buf[pos++] = byte;
     } while (len > 0);
@@ -176,7 +206,7 @@ INLINE u32 mqtt_encode_remaining_len(u8 *buf, u32 len) {
 // Encode fixed header
 // Returns: bytes written
 INLINE u32 mqtt_encode_fixed_header(u8 *buf, u8 type, u8 flags, u32 remaining) {
-    buf[0] = (type << 4) | (flags & 0x0F);
+    buf[0] = (u8)((type << MQTT_TYPE_SHIFT) | (flags & MQTT_FLAGS_MASK));
     return 1 + mqtt_encode_remaining_len(buf + 1, remaining);
 }
 

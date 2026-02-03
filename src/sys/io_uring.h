@@ -134,7 +134,12 @@ struct io_uring_sqe {
             u64 addr3;
             u64 __pad2[1];
         };
-        u8 cmd[0]; // Zero-length array (GCC/Clang extension, matches kernel)
+// NOLINTBEGIN(modernize-avoid-c-arrays)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wzero-length-array"
+        u8 cmd[0]; // Matches kernel struct
+#pragma clang diagnostic pop
+        // NOLINTEND(modernize-avoid-c-arrays)
     };
 };
 
