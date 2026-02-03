@@ -198,6 +198,8 @@ INLINE i32 sys_setsockopt(i32 fd, i32 level, i32 optname, const void *optval, u3
 // Signal handling
 #define SA_RESTORER 0x04000000
 #define SIGSET_SIZE 8 // sizeof(sigset_t) on x86_64
+#define SIGPIPE     13
+#define SIG_IGN     ((void (*)(i32))1)
 
 struct sigaction {
     void (*sa_handler)(i32);

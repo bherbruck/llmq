@@ -85,6 +85,14 @@ static void signal_handler(i32 sig) {
 
 static void setup_signals(struct broker *b) {
     g_broker = b;
+
+    // Ignore SIGPIPE (broken pipe when writing to closed socket)
+    struct sigaction sa_ign;
+    memset(&sa_ign, 0, sizeof(sa_ign));
+    sa_ign.sa_handler = SIG_IGN;
+    sys_sigaction(SIGPIPE, &sa_ign, NULL);
+
+    // Handle SIGINT/SIGTERM for graceful shutdown
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler  = signal_handler;
