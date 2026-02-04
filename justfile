@@ -24,16 +24,24 @@ clang_flags := "--target=" + target + " -fuse-ld=" + ld + " -Wl,--no-pie -static
 
 # === Build Recipes ===
 
-# Build release binary (default)
-build: _bindir
+# Build binary (type: release, debug, profile)
+build type="release": (_build type)
+
+_build type:
+    @just _build-{{type}}
+
+_build-release: _bindir
     {{cc}} {{cflags}} {{clang_flags}} -O3 -flto -DNDEBUG -o {{out}} {{sources}}
     strip {{out}}
     @echo "Built: {{out}} ($(stat -c%s {{out}}) bytes)"
 
-# Build debug binary
-debug: _bindir
+_build-debug: _bindir
     {{cc}} {{cflags}} {{clang_flags}} -g -O1 -fno-omit-frame-pointer -DDEBUG -o {{out}} {{sources}}
     @echo "Built: {{out}} (debug)"
+
+_build-profile: _bindir
+    {{cc}} {{cflags}} {{clang_flags}} -g -O3 -fno-omit-frame-pointer -DNDEBUG -o {{out}} {{sources}}
+    @echo "Built: {{out}} (profile - optimized with symbols)"
 
 # Build with sanitizers (requires libc, for testing only)
 sanitize: _bindir
@@ -93,16 +101,16 @@ compile-commands: _bindir
 
 # === Testing ===
 
-# Run the broker (debug build)
-run: debug
+# Run the broker (type: release, debug, profile)
+run type="release": (build type)
     {{out}}
 
 # Run with strace to see syscalls
-strace: debug
+strace: (build "debug")
     strace -f -e trace=io_uring_setup,io_uring_enter,io_uring_register {{out}}
 
 # Profile running broker with perf (attach to existing process)
-# Usage: start broker, connect clients, then run `just perf 30` to record for 30s
+# Usage: just profile && ./bin/broker, connect clients, then run `just perf 30`
 perf seconds="30":
     #!/usr/bin/env bash
     BROKER_PID=$(pidof broker)

@@ -272,7 +272,12 @@ static inline i32 _cl_parse_ini_line(const char *line, char *section, char *name
                 continue;                                                                        \
             }                                                                                    \
             i32 _matched = 0;                                                                    \
-            fields(CONFIG_CLI_FIELD) if (!_matched && _a[0] == '-') return -1;                   \
+            fields(CONFIG_CLI_FIELD) if (!_matched && _a[0] == '-') {                              \
+                _cl_print("Unknown option: ");                                                   \
+                _cl_print(_a);                                                                   \
+                _cl_print("\nUse --help for usage\n");                                           \
+                return -1;                                                                       \
+            }                                                                                    \
         }                                                                                        \
         (void)_prefix;                                                                           \
         return 0;                                                                                \

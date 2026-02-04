@@ -207,39 +207,73 @@ struct send_desc {
 STATIC_ASSERT(sizeof(struct send_desc) <= 96, "send_desc should be <= 96 bytes");
 
 // =============================================================================
-// Send Descriptor Pool
+// Send Descriptor Pool (Dynamic Growth)
 // =============================================================================
 
-#ifndef LLMQ_SEND_DESC_POOL_SIZE
-#define LLMQ_SEND_DESC_POOL_SIZE 4096 // Max concurrent sends
+// Growth increment: add this many slots when expanding
+#ifndef LLMQ_SEND_DESC_GROW_INCREMENT
+#define LLMQ_SEND_DESC_GROW_INCREMENT 16384
 #endif
 
 struct send_desc_pool {
-    struct send_desc *descs; // mmap'd array of send descriptors
+    struct send_desc *descs; // mmap'd array (large virtual reservation)
     u32 *free_stack;         // Stack of free descriptor indices
-    u32 capacity;            // Total number of slots
+    u32 max_capacity;        // Virtual reservation limit (configurable)
+    u32 capacity;            // Current logical capacity (grows dynamically)
     u32 free_count;          // Number of free slots
     u32 high_water;          // Peak usage
+    u32 grow_count;          // Number of times pool has grown
 };
 
 #define SEND_DESC_INVALID ((u32)-1)
 
-// Initialize send descriptor pool
-INLINE i32 send_desc_pool_init(struct send_desc_pool *p, u32 capacity) {
-    p->capacity   = capacity;
-    p->free_count = capacity;
-    p->high_water = 0;
+// Grow the pool by adding more slots (internal)
+INLINE bool send_desc_pool_grow(struct send_desc_pool *p) {
+    if (p->capacity >= p->max_capacity) {
+        return false; // Already at max
+    }
 
-    // mmap the descriptor array
-    usize descs_size = (usize)capacity * sizeof(struct send_desc);
+    u32 old_capacity = p->capacity;
+    u32 new_capacity = old_capacity + LLMQ_SEND_DESC_GROW_INCREMENT;
+    if (new_capacity > p->max_capacity) {
+        new_capacity = p->max_capacity;
+    }
+
+    // Initialize new slots and add to free stack
+    // Pages are demand-paged, so this just touches new memory
+    for (u32 i = old_capacity; i < new_capacity; i++) {
+        p->descs[i].state  = SEND_FREE;
+        p->descs[i].cursor = 0;
+        // Add to free stack (new slots go on top)
+        p->free_stack[p->free_count++] = i;
+    }
+
+    p->capacity = new_capacity;
+    p->grow_count++;
+    return true;
+}
+
+// Initialize send descriptor pool with dynamic growth
+// max_capacity: maximum entries (virtual reservation, configurable)
+// initial_capacity: starting capacity (physical pages touched)
+INLINE i32 send_desc_pool_init(struct send_desc_pool *p, u32 initial_capacity, u32 max_capacity) {
+    p->max_capacity = max_capacity;
+    p->capacity     = 0;
+    p->free_count   = 0;
+    p->high_water   = 0;
+    p->grow_count   = 0;
+
+    // Reserve large virtual address space for descriptors
+    // Physical pages allocated on-demand when touched
+    usize descs_size = (usize)max_capacity * sizeof(struct send_desc);
     p->descs         = (struct send_desc *)sys_mmap(NULL, descs_size, PROT_READ | PROT_WRITE,
                                                     MAP_PRIVATE | MAP_ANON, -1, 0);
     if (IS_ERR(p->descs)) {
         return -1;
     }
 
-    // mmap the free stack
-    usize stack_size = (usize)capacity * sizeof(u32);
+    // Reserve large virtual address space for free stack
+    usize stack_size = (usize)max_capacity * sizeof(u32);
     p->free_stack =
         (u32 *)sys_mmap(NULL, stack_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
     if (IS_ERR(p->free_stack)) {
@@ -247,12 +281,19 @@ INLINE i32 send_desc_pool_init(struct send_desc_pool *p, u32 capacity) {
         return -1;
     }
 
-    // Initialize free stack and descriptors
-    for (u32 i = 0; i < capacity; i++) {
-        p->free_stack[i]   = capacity - 1 - i;
+    // Initialize with initial capacity
+    u32 init_cap = initial_capacity;
+    if (init_cap > max_capacity) {
+        init_cap = max_capacity;
+    }
+
+    for (u32 i = 0; i < init_cap; i++) {
+        p->free_stack[i]   = init_cap - 1 - i;
         p->descs[i].state  = SEND_FREE;
         p->descs[i].cursor = 0;
     }
+    p->capacity   = init_cap;
+    p->free_count = init_cap;
 
     return 0;
 }
@@ -260,11 +301,11 @@ INLINE i32 send_desc_pool_init(struct send_desc_pool *p, u32 capacity) {
 // Cleanup send descriptor pool
 INLINE void send_desc_pool_cleanup(struct send_desc_pool *p) {
     if (p->descs) {
-        sys_munmap(p->descs, (usize)p->capacity * sizeof(struct send_desc));
+        sys_munmap(p->descs, (usize)p->max_capacity * sizeof(struct send_desc));
         p->descs = NULL;
     }
     if (p->free_stack) {
-        sys_munmap(p->free_stack, (usize)p->capacity * sizeof(u32));
+        sys_munmap(p->free_stack, (usize)p->max_capacity * sizeof(u32));
         p->free_stack = NULL;
     }
 }
@@ -278,10 +319,15 @@ INLINE struct send_desc *send_desc_pool_get(struct send_desc_pool *p, u32 idx) {
 }
 
 // Allocate a send descriptor, returns index or SEND_DESC_INVALID
+// Automatically grows pool if needed and possible
 INLINE u32 send_desc_pool_alloc(struct send_desc_pool *p) {
+    // Try to grow if exhausted
     if (p->free_count == 0) {
-        return SEND_DESC_INVALID;
+        if (!send_desc_pool_grow(p)) {
+            return SEND_DESC_INVALID; // At max capacity
+        }
     }
+
     p->free_count--;
 
     // Track high water mark
@@ -303,7 +349,7 @@ INLINE void send_desc_pool_free(struct send_desc_pool *p, u32 idx) {
     if (idx >= p->capacity) {
         return;
     }
-    p->descs[idx].state  = SEND_FREE;
+    p->descs[idx].state          = SEND_FREE;
     p->free_stack[p->free_count] = idx;
     p->free_count++;
 }

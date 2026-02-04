@@ -202,6 +202,8 @@ INLINE i32 sys_munmap(void *addr, usize len) {
 #define SOL_SOCKET   1
 #define SO_REUSEADDR 2
 #define SO_REUSEPORT 15
+#define IPPROTO_TCP  6
+#define TCP_NODELAY  1
 
 INLINE i32 sys_socket(i32 domain, i32 type, i32 protocol) {
     return (i32)syscall3(SYS_socket, domain, type, protocol);

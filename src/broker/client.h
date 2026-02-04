@@ -117,6 +117,8 @@ struct client_slot {
     u16 next_packet_id;                              // Next packet ID to allocate (wraps at 65535)
     u16 inflight_count;                              // Active inflight messages
     u16 max_inflight;                                // Runtime limit for this client
+    u16 inflight_free_hint;                          // Hint for next free slot (O(1) alloc)
+    u16 inflight_generation;                         // Generation counter for packet_id cycling
     struct inflight_msg inflight[LLMQ_MAX_INFLIGHT]; // Small metadata array
 };
 
@@ -159,9 +161,11 @@ INLINE void client_init(struct client_slot *c, i32 fd, u32 recv_buf_idx, u16 max
     c->pending_tail     = 0;
     c->pending_count    = 0;
     c->resp_slot        = 0;
-    c->next_packet_id   = 1;
-    c->inflight_count   = 0;
-    c->max_inflight     = max_inflight;
+    c->next_packet_id       = 1;
+    c->inflight_count       = 0;
+    c->max_inflight         = max_inflight;
+    c->inflight_free_hint   = 0;
+    c->inflight_generation  = 0;
     for (u16 i = 0; i < LLMQ_MAX_INFLIGHT; i++) {
         c->inflight[i].state         = INFLIGHT_FREE;
         c->inflight[i].msg_idx       = MSG_POOL_INVALID;
@@ -288,59 +292,52 @@ INLINE void client_pending_pop(struct client_slot *c) {
 // Error codes for client_inflight_alloc
 #define INFLIGHT_ERR_CLIENT_FULL (-1) // Per-client inflight limit exceeded
 
-// Allocate inflight slot for QoS 1/2 message
+// Allocate inflight slot for QoS 1/2 message - O(1) using direct indexing
+// Packet ID is chosen so that (packet_id - 1) % max_inflight = slot_index
 // Returns: inflight index (>=0), or INFLIGHT_ERR_CLIENT_FULL
 INLINE i32 client_inflight_alloc(struct client_slot *c, u8 qos, u32 msg_idx, u16 *out_packet_id) {
     if (c->inflight_count >= c->max_inflight) {
         return INFLIGHT_ERR_CLIENT_FULL;
     }
 
-    // Find free slot and allocate unique packet ID
-    for (u16 i = 0; i < c->max_inflight; i++) {
-        if (c->inflight[i].state == INFLIGHT_FREE) {
-            // Allocate unique packet ID
-            u16 start_id = c->next_packet_id;
-            do {
-                c->next_packet_id++;
-                if (c->next_packet_id == 0)
-                    c->next_packet_id = 1; // 0 is invalid
-
-                // Check if ID is in use
-                bool in_use = false;
-                for (u16 j = 0; j < c->max_inflight; j++) {
-                    if (c->inflight[j].state != INFLIGHT_FREE &&
-                        c->inflight[j].packet_id == c->next_packet_id) {
-                        in_use = true;
-                        break;
-                    }
-                }
-
-                if (!in_use) {
-                    *out_packet_id           = c->next_packet_id;
-                    c->inflight[i].packet_id = c->next_packet_id;
-                    // Store big-endian packet ID
-                    c->inflight[i].packet_id_be[0] = (u8)(c->next_packet_id >> 8);
-                    c->inflight[i].packet_id_be[1] = (u8)(c->next_packet_id & 0xFF);
-                    c->inflight[i].qos             = qos;
-                    c->inflight[i].dup_count       = 0;
-                    c->inflight[i].direction       = 0; // outgoing
-                    c->inflight[i].msg_idx         = msg_idx;
-                    c->inflight[i].send_desc_idx   = SEND_DESC_INVALID;
-
-                    if (qos == 1) {
-                        c->inflight[i].state = INFLIGHT_WAIT_PUBACK;
-                    } else {
-                        c->inflight[i].state = INFLIGHT_WAIT_PUBREC;
-                    }
-                    c->inflight_count++;
-                    return (i32)i;
-                }
-            } while (c->next_packet_id != start_id);
-
-            return -1; // No unique packet ID available
-        }
+    // Find free slot using free list hint, fall back to linear if needed
+    u16 slot = c->inflight_free_hint;
+    u16 searched = 0;
+    while (c->inflight[slot].state != INFLIGHT_FREE && searched < c->max_inflight) {
+        slot = (slot + 1) % c->max_inflight;
+        searched++;
     }
-    return -1;
+    if (c->inflight[slot].state != INFLIGHT_FREE) {
+        return -1; // Should never happen if count is accurate
+    }
+
+    // Assign packet_id such that (packet_id - 1) % max_inflight == slot
+    // This ensures O(1) lookup later
+    // packet_id = slot + 1 + (generation * max_inflight), where generation cycles
+    u16 base_id = slot + 1;
+    u16 packet_id = base_id + (c->inflight_generation * c->max_inflight);
+    if (packet_id == 0) packet_id = base_id; // Avoid 0
+
+    *out_packet_id           = packet_id;
+    c->inflight[slot].packet_id = packet_id;
+    c->inflight[slot].packet_id_be[0] = (u8)(packet_id >> 8);
+    c->inflight[slot].packet_id_be[1] = (u8)(packet_id & 0xFF);
+    c->inflight[slot].qos             = qos;
+    c->inflight[slot].dup_count       = 0;
+    c->inflight[slot].direction       = 0; // outgoing
+    c->inflight[slot].msg_idx         = msg_idx;
+    c->inflight[slot].send_desc_idx   = SEND_DESC_INVALID;
+    c->inflight[slot].state           = (qos == 1) ? INFLIGHT_WAIT_PUBACK : INFLIGHT_WAIT_PUBREC;
+
+    c->inflight_count++;
+    c->inflight_free_hint = (slot + 1) % c->max_inflight;
+
+    // Advance generation when we wrap around slot 0
+    if (slot == 0) {
+        c->inflight_generation++;
+    }
+
+    return (i32)slot;
 }
 
 // Track incoming QoS 2 message (no buffer needed - we're receiving, not sending)
@@ -376,8 +373,18 @@ INLINE i32 client_inflight_track_incoming(struct client_slot *c, u16 packet_id) 
     return -1;
 }
 
-// Find inflight entry by packet ID
+// Find inflight entry by packet ID - O(1) for outgoing messages
+// Uses direct indexing: slot = (packet_id - 1) % max_inflight
 INLINE struct inflight_msg *client_inflight_find(struct client_slot *c, u16 packet_id) {
+    if (packet_id == 0) return NULL;
+
+    // Direct index for O(1) lookup (works for outgoing messages we assigned)
+    u16 slot = (packet_id - 1) % c->max_inflight;
+    if (c->inflight[slot].state != INFLIGHT_FREE && c->inflight[slot].packet_id == packet_id) {
+        return &c->inflight[slot];
+    }
+
+    // Fall back to linear search for incoming messages (client-assigned packet_ids)
     for (u16 i = 0; i < c->max_inflight; i++) {
         if (c->inflight[i].state != INFLIGHT_FREE && c->inflight[i].packet_id == packet_id) {
             return &c->inflight[i];

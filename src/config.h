@@ -35,11 +35,11 @@
 #define LLMQ_RECV_BUF_SIZE 65536
 #endif
 
-// Inflight message limits (for QoS tracking and send buffers)
-// Memory per client = MAX_INFLIGHT * SEND_BUF_SIZE
-// With 4096 clients: 4096 * 16 * 4KB = 256MB total
+// Inflight message limits (for QoS tracking)
+// Memory per client = MAX_INFLIGHT * sizeof(inflight_msg) = 1024 * 16 = 16KB
+// With 4096 clients: 4096 * 16KB = 64MB total
 #ifndef LLMQ_MAX_INFLIGHT
-#define LLMQ_MAX_INFLIGHT 256 // Max capacity for inflight array (runtime can use less)
+#define LLMQ_MAX_INFLIGHT 1024 // Max capacity for inflight array (runtime can use less)
 #endif
 
 #ifndef LLMQ_SEND_BUF_SIZE

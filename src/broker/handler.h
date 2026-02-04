@@ -83,13 +83,9 @@ INLINE u32 steal_recv_buffer(struct broker *b, struct client_slot *pub, u32 pack
 
 // Forward publish to a single subscriber using zero-copy
 // Materializes PUBLISH header on-the-fly, uses scatter-gather for topic/payload
+// msg is pre-fetched by caller to avoid repeated lookups in fan-out loop
 static i32 forward_publish_zc(struct broker *b, u32 slot_idx, struct client_slot *sub,
-                               struct publish_ctx *pctx, u8 sub_qos) {
-    struct canonical_msg *msg = msg_pool_get(&b->msg_pool, pctx->msg_idx);
-    if (!msg) {
-        return -1;
-    }
-
+                               struct publish_ctx *pctx, struct canonical_msg *msg, u8 sub_qos) {
     // Downgrade QoS to minimum of publisher and subscriber
     u8 effective_qos = (msg->qos < sub_qos) ? msg->qos : sub_qos;
 
@@ -154,6 +150,13 @@ static void publish_node_cb(void *ctx, struct trie_node *node) {
     struct publish_ctx *pctx = (struct publish_ctx *)ctx;
     struct broker *b         = pctx->broker;
 
+    // Pre-fetch message once for all subscribers (was being fetched 2x per subscriber!)
+    struct canonical_msg *msg = msg_pool_get(&b->msg_pool, pctx->msg_idx);
+    if (!msg) {
+        return;
+    }
+    u8 pub_qos = msg->qos; // Cache for loop
+
     // Iterate slots in this node
     for (u32 slot = 0; slot < TRIE_FD_SLOTS; slot++) {
         u64 bits = node->fd_bitmap[slot] & ~pctx->sent_bitmap[slot];
@@ -165,9 +168,9 @@ static void publish_node_cb(void *ctx, struct trie_node *node) {
             // Mark as sent (avoid duplicates from multiple matching wildcards)
             pctx->sent_bitmap[slot] |= (1ULL << bit_idx);
 
-            // Get client slot
-            struct client_slot *c = broker_get_client(b, slot_idx);
-            if (!c || c->state != CLIENT_ACTIVE) {
+            // Get client slot (unchecked: slot_idx from bitmap, always < max_clients)
+            struct client_slot *c = broker_get_client_unchecked(b, slot_idx);
+            if (c->state != CLIENT_ACTIVE) {
                 // TODO: Queue for DORMANT clients
                 bits &= bits - 1;
                 continue;
@@ -175,9 +178,7 @@ static void publish_node_cb(void *ctx, struct trie_node *node) {
 
             // Forward the publish using zero-copy
             // TODO: Get per-subscription QoS from trie node
-            struct canonical_msg *msg = msg_pool_get(&b->msg_pool, pctx->msg_idx);
-            u8 sub_qos = msg ? msg->qos : 0; // For now, use publisher's QoS
-            forward_publish_zc(b, slot_idx, c, pctx, sub_qos);
+            forward_publish_zc(b, slot_idx, c, pctx, msg, pub_qos);
 
             bits &= bits - 1; // Clear lowest bit
         }

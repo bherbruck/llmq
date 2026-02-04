@@ -126,27 +126,29 @@ i32 broker_main(i32 argc, char **argv, char **envp) {
     memset(&b, 0, sizeof(b));
 
     // Calculate pool sizes
-    u32 msg_pool_size      = cfg.limits_msg_pool_size;
-    u32 send_desc_pool_size = cfg.limits_max_conns * cfg.limits_send_desc_mult;
+    u32 msg_pool_size       = cfg.limits_msg_pool_size;
+    u32 send_desc_initial   = cfg.limits_max_conns * cfg.limits_send_desc_mult;
+    // Convert MB to entries: MB * 1024 * 1024 / sizeof(send_desc)
+    u32 send_desc_max       = (cfg.limits_send_desc_max_mb * MB_DIVISOR) / sizeof(struct send_desc);
 
     // mmap client slots and fd mapping (max_fds = 2x clients for headroom)
     rc = broker_init(&b, cfg.limits_max_conns, cfg.limits_max_conns * FD_MULTIPLIER,
                      cfg.client_max_inflight, LLMQ_RECV_BUF_SIZE, msg_pool_size,
-                     send_desc_pool_size);
+                     send_desc_initial, send_desc_max);
     if (rc < 0) {
         log_error("broker_init failed (mmap): %d", rc);
         return 1;
     }
     b.port = cfg.network_port;
 
-    // Calculate actual memory usage from pools
+    // Calculate memory usage from pools (send_desc is dynamic, show initial)
     u64 client_mem    = (u64)cfg.limits_max_conns * sizeof(struct client_slot);
     u64 recv_mem      = (u64)cfg.limits_max_conns * LLMQ_RECV_BUF_SIZE;
     u64 msg_mem       = (u64)msg_pool_size * sizeof(struct canonical_msg);
-    u64 send_desc_mem = (u64)send_desc_pool_size * sizeof(struct send_desc);
-    log_info("Memory: clients=%lu KB, recv=%lu MB, msg=%lu KB, send_desc=%lu KB",
+    u64 sd_initial_b  = (u64)send_desc_initial * sizeof(struct send_desc);
+    log_info("Memory: clients=%lu KB, recv=%lu MB, msg=%lu KB, send_desc=%lu KB (max %u MB)",
              client_mem / KB_DIVISOR, recv_mem / MB_DIVISOR, msg_mem / KB_DIVISOR,
-             send_desc_mem / KB_DIVISOR);
+             sd_initial_b / KB_DIVISOR, cfg.limits_send_desc_max_mb);
 
     log_info("Initializing io_uring with %d entries...", cfg.limits_ring_entries);
 
@@ -180,17 +182,17 @@ i32 broker_main(i32 argc, char **argv, char **envp) {
     u32 msg_pct = b.msg_pool.capacity > 0
                       ? (b.msg_pool.high_water * PERCENT_MULTIPLIER) / b.msg_pool.capacity
                       : 0;
-    u32 sd_pct  = b.send_desc_pool.capacity > 0
-                      ? (b.send_desc_pool.high_water * PERCENT_MULTIPLIER) / b.send_desc_pool.capacity
-                      : 0;
-    log_info("Pools: msg=%u/%u (%u%%), send_desc=%u/%u (%u%%), recv=%u/%u, stolen=%lu",
+    u32 sd_max_cap = b.send_desc_pool.max_capacity;
+    u32 sd_pct  = sd_max_cap > 0 ? (b.send_desc_pool.high_water * PERCENT_MULTIPLIER) / sd_max_cap : 0;
+    log_info("Pools: msg=%u/%u (%u%%), send_desc=%u/%u/%u (%u%%, grew %u), recv=%u/%u, stolen=%lu",
              b.msg_pool.high_water, b.msg_pool.capacity, msg_pct,
-             b.send_desc_pool.high_water, b.send_desc_pool.capacity, sd_pct,
+             b.send_desc_pool.high_water, b.send_desc_pool.capacity, sd_max_cap, sd_pct,
+             b.send_desc_pool.grow_count,
              b.recv_pool.high_water, b.recv_pool.capacity, b.stolen_buffers);
     if (b.msgs_dropped > 0) {
-        log_info("Drops: %lu total (inflight_full=%lu, send_desc_empty=%lu, msg_pool_empty=%lu)",
+        log_info("Drops: %lu total (if=%lu sd=%lu msg=%lu sq=%lu fail=%lu)",
                  b.msgs_dropped, b.drops_inflight_full, b.drops_send_desc_empty,
-                 b.drops_msg_pool_empty);
+                 b.drops_msg_pool_empty, b.drops_sq_full, b.drops_send_failed);
     }
     if (b.recv_retries > 0) {
         log_info("SQ recovery: %lu recv retries", b.recv_retries);

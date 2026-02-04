@@ -199,6 +199,10 @@ INLINE void handle_accept(struct broker *b, struct io_uring_cqe *cqe) {
 
     b->accepts++;
 
+    // Disable Nagle's algorithm for low latency
+    i32 flag = 1;
+    sys_setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
+
     i32 slot_idx = broker_alloc_slot(b, client_fd);
     if (slot_idx < 0) {
         log_error("No free slots for fd=%d", client_fd);
@@ -495,12 +499,14 @@ INLINE void log_pool_stats(struct broker *b) {
                             ? (b->recv_retry_tail - b->recv_retry_head)
                             : (b->recv_retry_capacity - b->recv_retry_head + b->recv_retry_tail);
 
-    log_info("POOLS: msg=%u/%u sd=%u/%u recv=%u/%u retry=%u active=%u drops=%lu (sq=%lu fail=%lu)",
+    // Show dynamic pool info: used/capacity (grows to max)
+    // Drop breakdown: if=inflight_full, sd=send_desc_empty, sq=sq_full
+    log_info("POOLS: msg=%u/%u sd=%u/%u(%u) recv=%u/%u active=%u drops=%lu (if=%lu sd=%lu sq=%lu)",
              msg_used, b->msg_pool.capacity,
-             sd_used, b->send_desc_pool.capacity,
+             sd_used, b->send_desc_pool.capacity, b->send_desc_pool.grow_count,
              recv_used, b->recv_pool.capacity,
-             retry_pending, b->active_count, b->msgs_dropped,
-             b->drops_sq_full, b->drops_send_failed);
+             b->active_count, b->msgs_dropped,
+             b->drops_inflight_full, b->drops_send_desc_empty, b->drops_sq_full);
 }
 
 INLINE i32 broker_run(struct broker *b) {
@@ -517,26 +523,34 @@ INLINE i32 broker_run(struct broker *b) {
     u64 cqe_count       = 0;
 
     while (b->running) {
-        i32 rc = ring_submit(&b->ring, 1);
-        if (rc < 0) {
-            if (rc == -EINTR) {
-                continue; // Signal received, check b->running
-            }
+        // Submit pending SQEs without blocking
+        i32 rc = ring_submit(&b->ring, 0);
+        if (rc < 0 && rc != -EINTR) {
             log_error("io_uring_enter failed: %d", rc);
             return rc;
         }
 
+        // Process all available CQEs
         struct io_uring_cqe *cqe;
+        u32 processed = 0;
         while ((cqe = ring_peek_cqe(&b->ring)) != NULL) {
             dispatch_cqe(b, cqe);
             ring_cq_advance(&b->ring, 1);
             cqe_count++;
+            processed++;
         }
 
-        // Process any pending recv retries now that CQEs freed SQ space
         process_recv_retries(b);
 
-        // Log pool stats every ~5 seconds (based on CQE count as proxy for time)
+        // Only block when idle
+        if (processed == 0) {
+            rc = ring_submit(&b->ring, 1);
+            if (rc < 0 && rc != -EINTR) {
+                log_error("io_uring_enter failed: %d", rc);
+                return rc;
+            }
+        }
+
         if (cqe_count - last_stats_time > 50000) {
             log_pool_stats(b);
             last_stats_time = cqe_count;

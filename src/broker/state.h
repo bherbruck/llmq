@@ -74,7 +74,8 @@ struct broker {
 // =============================================================================
 
 INLINE i32 broker_init(struct broker *b, u32 max_clients, u32 max_fds, u16 max_inflight,
-                       u32 recv_buf_size, u32 msg_pool_size, u32 send_desc_pool_size) {
+                       u32 recv_buf_size, u32 msg_pool_size, u32 send_desc_initial,
+                       u32 send_desc_max) {
     b->max_clients   = max_clients;
     b->max_fds       = max_fds;
     b->max_inflight  = max_inflight;
@@ -107,8 +108,8 @@ INLINE i32 broker_init(struct broker *b, u32 max_clients, u32 max_fds, u16 max_i
         return -1;
     }
 
-    // Send descriptor pool: ephemeral send state for active sends
-    if (send_desc_pool_init(&b->send_desc_pool, send_desc_pool_size) < 0) {
+    // Send descriptor pool: ephemeral send state for active sends (dynamic growth)
+    if (send_desc_pool_init(&b->send_desc_pool, send_desc_initial, send_desc_max) < 0) {
         sys_munmap(b->recv_retry_queue, retry_size);
         buf_pool_cleanup(&b->recv_pool);
         msg_pool_cleanup(&b->msg_pool);
@@ -284,6 +285,12 @@ INLINE struct client_slot *broker_get_client_by_fd(struct broker *b, i32 fd) {
 INLINE struct client_slot *broker_get_client(struct broker *b, u32 slot_idx) {
     if (slot_idx >= b->max_clients)
         return NULL;
+    return &b->clients[slot_idx];
+}
+
+// Get slot by index - unchecked version for hot paths where slot_idx is known valid
+// (e.g., from bitmap iteration which is sized to max_clients)
+INLINE struct client_slot *broker_get_client_unchecked(struct broker *b, u32 slot_idx) {
     return &b->clients[slot_idx];
 }
 
