@@ -52,7 +52,12 @@ typedef _Bool bool;
 #define PACKED     __attribute__((packed))
 #define UNUSED     __attribute__((unused))
 #define NORETURN   __attribute__((noreturn))
-#define INLINE     static inline __attribute__((always_inline))
+// INLINE: always_inline in release, plain static in profile builds for visibility
+#ifdef PROFILE_BUILD
+#define INLINE static
+#else
+#define INLINE static inline __attribute__((always_inline))
+#endif
 
 // Cache line size (x86_64)
 #define CACHE_LINE 64

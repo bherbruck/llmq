@@ -25,6 +25,10 @@
 #define IORING_ENTER_SQ_WAIT   (1U << 2)
 #define IORING_ENTER_EXT_ARG   (1U << 3)
 
+// SQ ring flags (for SQPOLL mode)
+#define IORING_SQ_NEED_WAKEUP (1U << 0) // Kernel SQ poll thread needs wakeup
+#define IORING_SQ_CQ_OVERFLOW (1U << 1) // CQ overflowed
+
 // SQE flags
 #define IOSQE_FIXED_FILE       (1U << 0)
 #define IOSQE_IO_DRAIN         (1U << 1)
@@ -197,10 +201,12 @@ struct io_uring_params {
 
 struct ring {
     i32 fd;
+    bool sqpoll; // Using SQPOLL mode
 
     // Submission queue
     u32 *sq_head;
     u32 *sq_tail;
+    u32 *sq_flags; // For SQPOLL: check IORING_SQ_NEED_WAKEUP
     u32 *sq_array;
     u32 sq_mask;
     u32 sq_entries;
@@ -211,6 +217,8 @@ struct ring {
     u32 *cq_tail;
     u32 cq_mask;
     u32 cq_entries;
+    u32 cq_head_local; // Local head for batched advance (no store-release until flush)
+    u32 cq_tail_local; // Local tail snapshot (loaded once per batch with acquire)
     struct io_uring_cqe *cqes;
 
     // Memory mappings (for cleanup)
@@ -235,7 +243,9 @@ struct ring {
 // =============================================================================
 
 // Initialize the ring (returns 0 on success, -errno on failure)
-i32 ring_init(struct ring *r, u32 entries);
+// Initialize ring. If use_sqpoll is true, kernel thread polls SQ (no syscalls for submit).
+// sq_thread_idle_ms: milliseconds before SQPOLL thread goes idle (0 = kernel default ~1000ms)
+i32 ring_init(struct ring *r, u32 entries, bool use_sqpoll, u32 sq_thread_idle_ms);
 
 // Cleanup the ring
 void ring_cleanup(struct ring *r);
@@ -272,11 +282,37 @@ INLINE u32 ring_sq_pending(struct ring *r) {
     return *r->sq_tail - io_uring_smp_load_acquire(r->sq_head);
 }
 
+// Check if SQPOLL kernel thread needs wakeup
+INLINE bool ring_sq_need_wakeup(struct ring *r) {
+    if (!r->sqpoll || !r->sq_flags) {
+        return false;
+    }
+    return (io_uring_smp_load_acquire(r->sq_flags) & IORING_SQ_NEED_WAKEUP) != 0;
+}
+
 // Submit pending SQEs and optionally wait for completions
-// With COOP_TASKRUN, completions can be processed opportunistically
-// We still use GETEVENTS to ensure we get completions when waiting
+// With SQPOLL: kernel polls SQ, only syscall needed for wakeup or waiting
+// Without SQPOLL: syscall needed for every submit
 INLINE i32 ring_submit(struct ring *r, u32 wait_nr) {
     u32 submitted = ring_sq_pending(r);
+
+    if (r->sqpoll) {
+        // SQPOLL: kernel thread picks up SQEs automatically
+        // Only syscall if we need to wake it up or wait for completions
+        u32 flags = 0;
+        if (ring_sq_need_wakeup(r)) {
+            flags |= IORING_ENTER_SQ_WAKEUP;
+        }
+        if (wait_nr > 0) {
+            flags |= IORING_ENTER_GETEVENTS;
+        }
+        if (flags == 0) {
+            return (i32)submitted; // No syscall needed
+        }
+        return sys_io_uring_enter(r->fd, 0, wait_nr, flags, NULL);
+    }
+
+    // Non-SQPOLL: must syscall to submit
     if (submitted == 0 && wait_nr == 0) {
         return 0; // Nothing to do
     }
@@ -287,24 +323,38 @@ INLINE i32 ring_submit(struct ring *r, u32 wait_nr) {
 // Submit and wait for at least min_complete CQEs
 INLINE i32 ring_submit_and_wait(struct ring *r, u32 min_complete) {
     u32 submitted = ring_sq_pending(r);
-    return sys_io_uring_enter(r->fd, submitted, min_complete, IORING_ENTER_GETEVENTS, NULL);
+    u32 flags     = IORING_ENTER_GETEVENTS;
+    if (r->sqpoll && ring_sq_need_wakeup(r)) {
+        flags |= IORING_ENTER_SQ_WAKEUP;
+    }
+    return sys_io_uring_enter(r->fd, r->sqpoll ? 0 : submitted, min_complete, flags, NULL);
 }
 
-// Peek at next CQE (returns NULL if CQ is empty)
-INLINE struct io_uring_cqe *ring_peek_cqe(struct ring *r) {
-    u32 head = *r->cq_head;
-    u32 tail = io_uring_smp_load_acquire(r->cq_tail);
+// Sync local head/tail with kernel (call at start of CQE processing batch)
+// Single acquire fence for entire batch - no atomics in processing loop
+INLINE void ring_cq_sync(struct ring *r) {
+    r->cq_head_local = *r->cq_head;
+    r->cq_tail_local = io_uring_smp_load_acquire(r->cq_tail);
+}
 
-    if (unlikely(head == tail)) {
+// Peek at next CQE using local head/tail (no memory barriers, fast)
+INLINE struct io_uring_cqe *ring_peek_cqe(struct ring *r) {
+    if (r->cq_head_local == r->cq_tail_local) {
         return NULL;
     }
-
-    return &r->cqes[head & r->cq_mask];
+    return &r->cqes[r->cq_head_local & r->cq_mask];
 }
 
-// Advance CQ head (call after processing CQE)
+// Advance local CQ head (no store-release, just bump counter)
 INLINE void ring_cq_advance(struct ring *r, u32 nr) {
-    io_uring_smp_store_release(r->cq_head, *r->cq_head + nr);
+    r->cq_head_local += nr;
+}
+
+// Flush local head to kernel (single store-release for entire batch)
+INLINE void ring_cq_flush(struct ring *r) {
+    if (r->cq_head_local != *r->cq_head) {
+        io_uring_smp_store_release(r->cq_head, r->cq_head_local);
+    }
 }
 
 // =============================================================================

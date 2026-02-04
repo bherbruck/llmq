@@ -131,28 +131,47 @@ INLINE void submit_send_zc(struct broker *b, i32 fd, u32 send_desc_idx) {
     ring_submit_sqe(&b->ring);
 }
 
-// Send simple scatter-gather response synchronously (non-blocking)
-// Used for protocol responses (CONNACK, PUBACK, etc.)
-// Using synchronous send prevents fd-reuse race where async send would
-// execute after fd is closed and reused for a different client.
-// MSG_DONTWAIT ensures we don't block if socket buffer is full.
-INLINE void submit_send_writev_simple(struct broker *b, i32 fd, struct iovec *iov, u32 nr_vecs) {
-    struct msghdr msg = {
-        .msg_name       = NULL,
-        .msg_namelen    = 0,
-        .msg_iov        = iov,
-        .msg_iovlen     = nr_vecs,
-        .msg_control    = NULL,
-        .msg_controllen = 0,
-        .msg_flags      = 0,
-    };
-    i64 rc = sys_sendmsg(fd, &msg, MSG_DONTWAIT);
+// =============================================================================
+// Synchronous Protocol Responses (simple, no buffering complexity)
+// =============================================================================
+
+// Send static const buffer synchronously (e.g., PINGRESP)
+// Returns true if sent, false if client not active
+INLINE bool send_static(struct broker *b, struct client_slot *c, const void *buf, u32 len) {
+    if (c->state != CLIENT_ACTIVE) {
+        return false;
+    }
+    i64 rc = sys_write(c->fd, buf, len);
     if (rc > 0) {
         b->bytes_sent += (u64)rc;
     }
-    // If EAGAIN/EWOULDBLOCK (-11), socket buffer full - client too slow, ignore
-    // If other error, connection broken - recv will handle close
-    (void)b; // Suppress unused warning when logging disabled
+    return rc == (i64)len;
+}
+
+// Send 4-byte protocol response synchronously (header + packet_id)
+// Used for PUBACK, PUBREC, PUBREL, PUBCOMP
+INLINE bool send_resp(struct broker *b, struct client_slot *c, const u8 *hdr, u16 packet_id) {
+    if (c->state != CLIENT_ACTIVE) {
+        return false;
+    }
+    u8 pkt[4] = {hdr[0], hdr[1], (u8)(packet_id >> 8), (u8)(packet_id & 0xFF)};
+    i64 rc = sys_write(c->fd, pkt, 4);
+    if (rc > 0) {
+        b->bytes_sent += (u64)rc;
+    }
+    return rc == 4;
+}
+
+// Send variable-length buffer synchronously (e.g., CONNACK, SUBACK)
+INLINE bool send_buf(struct broker *b, struct client_slot *c, const void *buf, u32 len) {
+    if (c->state != CLIENT_ACTIVE) {
+        return false;
+    }
+    i64 rc = sys_write(c->fd, buf, len);
+    if (rc > 0) {
+        b->bytes_sent += (u64)rc;
+    }
+    return rc == (i64)len;
 }
 
 // Submit close and mark client as CLOSING to prevent new operations on this fd.
@@ -173,6 +192,9 @@ INLINE void submit_close(struct broker *b, i32 fd) {
         return;
     }
     ring_prep_close(sqe, fd);
+    // DRAIN ensures all pending sends complete before close.
+    // Without this, SQPOLL can reorder: new accept gets same fd, pending send goes to wrong client.
+    sqe->flags     = IOSQE_IO_DRAIN;
     sqe->user_data = make_user_data(OP_CLOSE, (u32)fd, 0);
     ring_submit_sqe(&b->ring);
 }
@@ -394,18 +416,24 @@ INLINE void handle_send_zc(struct broker *b, struct io_uring_cqe *cqe) {
         }
     }
 
-    // For QoS > 0, unlink send_desc from inflight - O(1) using packet_id as index
-    // The inflight entry (and its refcount) is released when ACK ceremony completes
+    // For QoS > 0, handle inflight entry
     if (sd->sub_qos > 0 && sd->packet_id != 0) {
         struct client_slot *c = broker_get_client(b, sd->slot_idx);
         // Check generation to detect slot reuse - if slot was reused,
         // the old inflight entries are gone and we shouldn't touch new client's inflight
         if (c && c->generation == sd->slot_gen) {
             // O(1) lookup: packet_id maps directly to inflight slot
-            u16 inf_idx = (sd->packet_id - 1) % c->max_inflight;
+            u16 inf_idx = (sd->packet_id - 1) & c->inflight_mask;
             if (c->inflight[inf_idx].packet_id == sd->packet_id &&
                 c->inflight[inf_idx].send_desc_idx == send_desc_idx) {
-                c->inflight[inf_idx].send_desc_idx = SEND_DESC_INVALID;
+                if (cqe->res < 0) {
+                    // Send failed - release ref and free inflight (no ACK coming)
+                    release_msg_ref(b, c->inflight[inf_idx].msg_idx);
+                    client_inflight_free(c, &c->inflight[inf_idx]);
+                } else {
+                    // Send succeeded - just unlink send_desc, wait for ACK
+                    c->inflight[inf_idx].send_desc_idx = SEND_DESC_INVALID;
+                }
             }
         }
     }
@@ -561,7 +589,8 @@ INLINE i32 broker_run(struct broker *b) {
             return rc;
         }
 
-        // Process all available CQEs
+        // Process all available CQEs (batched CQ advance - single store-release at end)
+        ring_cq_sync(&b->ring);
         struct io_uring_cqe *cqe;
         u32 processed = 0;
         while ((cqe = ring_peek_cqe(&b->ring)) != NULL) {
@@ -570,6 +599,7 @@ INLINE i32 broker_run(struct broker *b) {
             cqe_count++;
             processed++;
         }
+        ring_cq_flush(&b->ring);
 
         process_recv_retries(b);
 

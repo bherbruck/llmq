@@ -73,6 +73,7 @@ struct broker {
     u64 drops_msg_pool_empty;     // Message pool exhausted
     u64 drops_sq_full;            // SQ full during fan-out submit
     u64 drops_send_failed;        // Send completions with error
+    u64 drops_resp_full;          // Protocol response dropped (resp_slots busy)
     u64 stolen_buffers;           // Count of recv buffers stolen for fan-out
     u64 recv_retries;             // Count of recv submissions retried from SQ-full
 };
@@ -431,11 +432,11 @@ INLINE void broker_slot_resume(struct broker *b, u32 slot_idx, i32 fd) {
 // =============================================================================
 
 enum op_type {
-    OP_ACCEPT      = 1,
-    OP_RECV        = 2,
-    OP_SEND        = 3,
-    OP_CLOSE       = 4,
-    OP_SEND_ZC     = 5, // Zero-copy send: context = send_desc index
+    OP_ACCEPT  = 1,
+    OP_RECV    = 2,
+    OP_SEND    = 3,
+    OP_CLOSE   = 4,
+    OP_SEND_ZC = 5, // Zero-copy send: context = send_desc index
 };
 
 // Pack: [8-bit op][24-bit fd][32-bit context]

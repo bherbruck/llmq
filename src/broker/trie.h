@@ -1,5 +1,5 @@
 // broker/trie.h - Topic trie for subscription matching
-// O(topic_levels) lookup with wildcard support
+// O(1) child lookup via hash table, O(topic_levels) total lookup with wildcard support
 
 #ifndef BROKER_TRIE_H
 #define BROKER_TRIE_H
@@ -19,18 +19,42 @@
 #define BITS_PER_SLOT     64                                 // Bits per u64 bitmap slot
 #define TRIE_FD_SLOTS     (LLMQ_MAX_CLIENTS / BITS_PER_SLOT) // Scales with max clients
 
+// Hash table size for child lookup (power of 2, >= TRIE_MAX_CHILDREN)
+#define TRIE_CHILD_HASH_SIZE 64
+#define TRIE_CHILD_HASH_MASK (TRIE_CHILD_HASH_SIZE - 1)
+
+// =============================================================================
+// Hash Function (FNV-1a for segment names)
+// =============================================================================
+
+#define TRIE_FNV_OFFSET 2166136261u
+#define TRIE_FNV_PRIME  16777619u
+
+INLINE u32 trie_hash_segment(const u8 *seg, u8 len) {
+    u32 hash = TRIE_FNV_OFFSET;
+    for (u8 i = 0; i < len; i++) {
+        hash ^= seg[i];
+        hash *= TRIE_FNV_PRIME;
+    }
+    return hash;
+}
+
 // =============================================================================
 // Trie Node
 // =============================================================================
 
 struct trie_node {
-    // Subscriber tracking (fd bitmap)
-    u64 fd_bitmap[TRIE_FD_SLOTS]; // 1024 bits for fds
-    u32 sub_count;                // Active subscriber count
+    // Subscriber tracking (fd bitmap + generation for slot reuse detection)
+    u64 fd_bitmap[TRIE_FD_SLOTS];                    // 1024 bits for slot_idx
+    u8 fd_gen[TRIE_FD_SLOTS * BITS_PER_SLOT];        // Generation when subscribed
+    u32 sub_count;                                   // Active subscriber count
 
     // Trie structure
-    u32 parent; // Parent node index
-    u32 children[TRIE_MAX_CHILDREN];
+    u32 parent;                             // Parent node index
+    u32 plus_child;                         // Direct '+' wildcard child (0 = none)
+    u32 hash_child;                         // Direct '#' wildcard child (0 = none)
+    u32 child_hash[TRIE_CHILD_HASH_SIZE];   // Hash table: segment hash → child_idx (0 = empty)
+    u32 children[TRIE_MAX_CHILDREN];        // Linear array for iteration
     u16 child_count;
 
     // Segment name
@@ -94,59 +118,84 @@ INLINE void trie_free(struct topic_trie *t, u32 idx) {
 }
 
 // =============================================================================
-// Child Node Operations
+// Child Node Operations (O(1) via hash table and direct wildcard pointers)
 // =============================================================================
 
-// Find child matching segment
+// Find child matching segment - O(1) average via hash table
 INLINE u32 trie_find_child(struct topic_trie *t, u32 node_idx, const u8 *seg, u8 seg_len) {
     struct trie_node *node = &t->nodes[node_idx];
+    u32 hash               = trie_hash_segment(seg, seg_len);
+    u32 idx                = hash & TRIE_CHILD_HASH_MASK;
 
-    for (u16 i = 0; i < node->child_count; i++) {
-        u32 child_idx           = node->children[i];
+    // Linear probing (table is sparse, usually finds on first try)
+    for (u32 probe = 0; probe < TRIE_CHILD_HASH_SIZE; probe++) {
+        u32 child_idx = node->child_hash[idx];
+        if (child_idx == 0) {
+            return 0; // Empty slot - not found
+        }
+
         struct trie_node *child = &t->nodes[child_idx];
-
-        // Length check first (cheap), then memcmp (likely match after length passes)
+        // Verify full match (handle hash collisions)
         if (child->name_len == seg_len && likely(memcmp(child->name, seg, seg_len) == 0)) {
             return child_idx;
         }
+
+        idx = (idx + 1) & TRIE_CHILD_HASH_MASK;
     }
-    return 0; // Not found
+    return 0; // Table full (shouldn't happen with proper sizing)
 }
 
-// Find '+' wildcard child
+// Find '+' wildcard child - O(1) direct lookup
 INLINE u32 trie_find_plus(struct topic_trie *t, u32 node_idx) {
-    struct trie_node *node = &t->nodes[node_idx];
-
-    for (u16 i = 0; i < node->child_count; i++) {
-        if (t->nodes[node->children[i]].is_plus) {
-            return node->children[i];
-        }
-    }
-    return 0;
+    return t->nodes[node_idx].plus_child;
 }
 
-// Find '#' wildcard child
+// Find '#' wildcard child - O(1) direct lookup
 INLINE u32 trie_find_hash(struct topic_trie *t, u32 node_idx) {
-    struct trie_node *node = &t->nodes[node_idx];
-
-    for (u16 i = 0; i < node->child_count; i++) {
-        if (t->nodes[node->children[i]].is_hash) {
-            return node->children[i];
-        }
-    }
-    return 0;
+    return t->nodes[node_idx].hash_child;
 }
 
-// Add child to node
+// Insert child into hash table
+INLINE bool trie_hash_insert(struct trie_node *parent, u32 child_idx, u32 hash) {
+    u32 idx = hash & TRIE_CHILD_HASH_MASK;
+
+    for (u32 probe = 0; probe < TRIE_CHILD_HASH_SIZE; probe++) {
+        if (parent->child_hash[idx] == 0) {
+            parent->child_hash[idx] = child_idx;
+            return true;
+        }
+        idx = (idx + 1) & TRIE_CHILD_HASH_MASK;
+    }
+    return false; // Table full
+}
+
+// Add child to node - maintains hash table and wildcard pointers
 INLINE bool trie_add_child(struct topic_trie *t, u32 parent_idx, u32 child_idx) {
     struct trie_node *parent = &t->nodes[parent_idx];
+    struct trie_node *child  = &t->nodes[child_idx];
 
     if (parent->child_count >= TRIE_MAX_CHILDREN) {
         return false;
     }
 
+    // Add to linear array (for iteration)
     parent->children[parent->child_count++] = child_idx;
-    t->nodes[child_idx].parent              = parent_idx;
+    child->parent                           = parent_idx;
+
+    // Add to hash table for O(1) lookup
+    u32 hash = trie_hash_segment(child->name, child->name_len);
+    if (!trie_hash_insert(parent, child_idx, hash)) {
+        parent->child_count--; // Rollback
+        return false;
+    }
+
+    // Update direct wildcard pointers
+    if (child->is_plus) {
+        parent->plus_child = child_idx;
+    } else if (child->is_hash) {
+        parent->hash_child = child_idx;
+    }
+
     return true;
 }
 
@@ -154,9 +203,9 @@ INLINE bool trie_add_child(struct topic_trie *t, u32 parent_idx, u32 child_idx) 
 // Subscribe
 // =============================================================================
 
-INLINE i32 trie_subscribe(struct topic_trie *t, const u8 *filter, u16 len, u32 fd) {
-    if (fd >= TRIE_FD_SLOTS * BITS_PER_SLOT) {
-        return -1; // fd out of range
+INLINE i32 trie_subscribe(struct topic_trie *t, const u8 *filter, u16 len, u32 slot_idx, u8 gen) {
+    if (slot_idx >= TRIE_FD_SLOTS * BITS_PER_SLOT) {
+        return -1; // slot_idx out of range
     }
 
     u32 node_idx         = 0; // Start at root
@@ -197,14 +246,18 @@ INLINE i32 trie_subscribe(struct topic_trie *t, const u8 *filter, u16 len, u32 f
         node_idx = child_idx;
     }
 
-    // Add fd to bitmap
+    // Add slot_idx to bitmap with generation
     struct trie_node *sub_node = &t->nodes[node_idx];
-    u32 slot                   = fd / BITS_PER_SLOT;
-    u64 bit                    = 1ULL << (fd % BITS_PER_SLOT);
+    u32 slot                   = slot_idx / BITS_PER_SLOT;
+    u64 bit                    = 1ULL << (slot_idx % BITS_PER_SLOT);
 
     if (!(sub_node->fd_bitmap[slot] & bit)) {
         sub_node->fd_bitmap[slot] |= bit;
+        sub_node->fd_gen[slot_idx] = gen;  // Store generation
         sub_node->sub_count++;
+    } else {
+        // Already subscribed - update generation (handles reconnect with same slot)
+        sub_node->fd_gen[slot_idx] = gen;
     }
 
     return 0;
@@ -318,7 +371,66 @@ static void trie_match_recursive(struct topic_trie *t, u32 node_idx, const u8 *t
 }
 
 // =============================================================================
-// Iterate Subscribers in a Node
+// Matching (collect mode - no callback overhead)
+// =============================================================================
+
+#define TRIE_MAX_MATCHES 64
+
+struct trie_match_result {
+    struct trie_node *nodes[TRIE_MAX_MATCHES];
+    u32 count;
+};
+
+// Forward declaration for recursion
+static void trie_match_collect_recursive(struct topic_trie *t, u32 node_idx, const u8 *topic,
+                                         u16 pos, u16 len, struct trie_match_result *result);
+
+INLINE void trie_match_collect(struct topic_trie *t, const u8 *topic, u16 len,
+                               struct trie_match_result *result) {
+    result->count = 0;
+    trie_match_collect_recursive(t, 0, topic, 0, len, result);
+}
+
+static void trie_match_collect_recursive(struct topic_trie *t, u32 node_idx, const u8 *topic,
+                                         u16 pos, u16 len, struct trie_match_result *result) {
+    // Check for '#' wildcard child (matches all remaining)
+    // No branch hints - pattern is stable, let CPU predictor learn
+    u32 hash_child = trie_find_hash(t, node_idx);
+    if (hash_child != 0 && t->nodes[hash_child].sub_count > 0) {
+        if (result->count < TRIE_MAX_MATCHES) {
+            result->nodes[result->count++] = &t->nodes[hash_child];
+        }
+    }
+
+    // At end of topic - check for subscribers here
+    if (pos >= len) {
+        if (t->nodes[node_idx].sub_count > 0 && result->count < TRIE_MAX_MATCHES) {
+            result->nodes[result->count++] = &t->nodes[node_idx];
+        }
+        return;
+    }
+
+    // Extract current segment
+    struct mqtt_str seg;
+    u16 next_pos = topic_extract_segment(topic, len, pos, &seg);
+
+    // Check '+' wildcard child (matches this segment)
+    u32 plus_child = trie_find_plus(t, node_idx);
+    if (plus_child != 0) {
+        trie_match_collect_recursive(t, plus_child, topic, next_pos, len, result);
+    }
+
+    // Check exact match child
+    if (seg.len <= TRIE_MAX_SEGMENT) {
+        u32 exact_child = trie_find_child(t, node_idx, seg.ptr, (u8)seg.len);
+        if (exact_child != 0) {
+            trie_match_collect_recursive(t, exact_child, topic, next_pos, len, result);
+        }
+    }
+}
+
+// =============================================================================
+// Iterate Subscribers in a Node (callback version - kept for compatibility)
 // =============================================================================
 
 typedef void (*trie_fd_cb)(void *ctx, u32 fd);

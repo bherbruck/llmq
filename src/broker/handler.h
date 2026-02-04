@@ -17,11 +17,12 @@
 // Forward declare functions (defined in loop.h which includes this file)
 INLINE void submit_send(struct broker *b, i32 fd, const u8 *buf, u32 len);
 INLINE void submit_send_zc(struct broker *b, i32 fd, u32 send_desc_idx);
-INLINE void submit_send_writev_simple(struct broker *b, i32 fd, struct iovec *iov, u32 nr_vecs);
+INLINE bool send_static(struct broker *b, struct client_slot *c, const void *buf, u32 len);
+INLINE bool send_resp(struct broker *b, struct client_slot *c, const u8 *hdr, u16 packet_id);
+INLINE bool send_buf(struct broker *b, struct client_slot *c, const void *buf, u32 len);
 INLINE void release_msg_ref(struct broker *b, u32 msg_idx);
 
 // Static headers for zero-copy protocol responses (type<<4 | flags, remaining_len)
-static const u8 HDR_CONNACK[4]  = {0x20, 0x02, 0x00, 0x00}; // Session=0, accepted
 static const u8 HDR_PUBACK[2]   = {0x40, 0x02};
 static const u8 HDR_PUBREC[2]   = {0x50, 0x02};
 static const u8 HDR_PUBREL[2]   = {0x62, 0x02};
@@ -34,23 +35,23 @@ static const u8 HDR_PINGRESP[2] = {0xD0, 0x00};
 // =============================================================================
 
 INLINE void send_puback(struct broker *b, struct client_slot *c, u16 packet_id) {
-    struct iovec *iov = client_setup_resp_pkt(c, HDR_PUBACK, packet_id);
-    submit_send_writev_simple(b, c->fd, iov, 2);
+    send_resp(b, c, HDR_PUBACK, packet_id);
 }
 
 INLINE void send_pubrec(struct broker *b, struct client_slot *c, u16 packet_id) {
-    struct iovec *iov = client_setup_resp_pkt(c, HDR_PUBREC, packet_id);
-    submit_send_writev_simple(b, c->fd, iov, 2);
+    send_resp(b, c, HDR_PUBREC, packet_id);
 }
 
 INLINE void send_pubrel(struct broker *b, struct client_slot *c, u16 packet_id) {
-    struct iovec *iov = client_setup_resp_pkt(c, HDR_PUBREL, packet_id);
-    submit_send_writev_simple(b, c->fd, iov, 2);
+    send_resp(b, c, HDR_PUBREL, packet_id);
 }
 
 INLINE void send_pubcomp(struct broker *b, struct client_slot *c, u16 packet_id) {
-    struct iovec *iov = client_setup_resp_pkt(c, HDR_PUBCOMP, packet_id);
-    submit_send_writev_simple(b, c->fd, iov, 2);
+    send_resp(b, c, HDR_PUBCOMP, packet_id);
+}
+
+INLINE void send_unsuback(struct broker *b, struct client_slot *c, u16 packet_id) {
+    send_resp(b, c, HDR_UNSUBACK, packet_id);
 }
 
 // Include FSM after protocol senders are defined
@@ -126,42 +127,42 @@ static i32 forward_publish_zc(struct broker *b, u32 slot_idx, struct client_slot
     return rc;
 }
 
-// Callback for trie node match - send to matching slots
-static void publish_node_cb(void *ctx, struct trie_node *node) {
-    struct publish_ctx *pctx = (struct publish_ctx *)ctx;
-    struct broker *b         = pctx->broker;
-
-    // Pre-fetch message once for all subscribers (was being fetched 2x per subscriber!)
+// Process collected trie matches - no callback overhead, fully inlined
+INLINE void process_publish_matches(struct broker *b, struct publish_ctx *pctx,
+                                    struct trie_match_result *matches) {
+    // Pre-fetch message once for all nodes (not per-callback)
     struct canonical_msg *msg = msg_pool_get(&b->msg_pool, pctx->msg_idx);
     if (unlikely(!msg)) {
         return;
     }
-    u8 pub_qos = msg->qos; // Cache for loop
+    u8 pub_qos = msg->qos; // Cache for all loops
 
-    // Iterate slots in this node
-    for (u32 slot = 0; slot < TRIE_FD_SLOTS; slot++) {
-        u64 bits = node->fd_bitmap[slot] & ~pctx->sent_bitmap[slot];
-        if (likely(bits == 0)) continue; // Skip empty slots quickly
+    // Process collected nodes (flat loop, no function pointer calls)
+    for (u32 m = 0; m < matches->count; m++) {
+        struct trie_node *node = matches->nodes[m];
 
-        while (bits) {
-            u32 bit_idx  = (u32)__builtin_ctzll(bits);
-            u32 slot_idx = slot * BITS_PER_SLOT + bit_idx;
+        // Iterate slots in this node
+        for (u32 slot = 0; slot < TRIE_FD_SLOTS; slot++) {
+            u64 bits = node->fd_bitmap[slot] & ~pctx->sent_bitmap[slot];
+            if (likely(bits == 0)) continue; // Skip empty slots quickly
 
-            // Mark as sent (avoid duplicates from multiple matching wildcards)
-            pctx->sent_bitmap[slot] |= (1ULL << bit_idx);
+            while (bits) {
+                u32 bit_idx  = (u32)__builtin_ctzll(bits);
+                u32 slot_idx = slot * BITS_PER_SLOT + bit_idx;
 
-            // Get client slot (unchecked: slot_idx from bitmap, always < max_clients)
-            struct client_slot *c = broker_get_client_unchecked(b, slot_idx);
-            if (unlikely(c->state != CLIENT_ACTIVE)) {
-                // Skip dormant/closing clients
-                bits &= bits - 1;
-                continue;
+                // Mark as sent (avoid duplicates from multiple matching wildcards)
+                pctx->sent_bitmap[slot] |= (1ULL << bit_idx);
+
+                // Get client slot and validate generation to prevent slot-reuse race:
+                // If slot was reused for a new client, generation won't match the
+                // one stored when subscription was made → skip (stale subscription)
+                struct client_slot *c = broker_get_client_unchecked(b, slot_idx);
+                if (likely(c->state == CLIENT_ACTIVE && c->generation == node->fd_gen[slot_idx])) {
+                    forward_publish_zc(b, slot_idx, c, pctx, msg, pub_qos);
+                }
+
+                bits &= bits - 1; // Clear lowest bit
             }
-
-            // Forward the publish using zero-copy
-            forward_publish_zc(b, slot_idx, c, pctx, msg, pub_qos);
-
-            bits &= bits - 1; // Clear lowest bit
         }
     }
 }
@@ -195,16 +196,12 @@ INLINE i32 process_mqtt_packet(struct broker *b, struct client_slot *c, const u8
         struct mqtt_connect conn_pkt;
         i32 rc = mqtt_parse_connect(var_hdr, var_len, &conn_pkt);
         if (rc < 0) {
-            // Send CONNACK with error
-            u8 slot = client_get_resp_slot(c);
-            c->resp_buf[slot][0] = 0; // session present = false
-            c->resp_buf[slot][1] =
-                (rc == MQTT_ERR_PROTOCOL) ? MQTT_CONNACK_PROTO_VERSION : MQTT_CONNACK_ID_REJECTED;
-            c->resp_iov[slot][0].iov_base = (void *)HDR_CONNACK;
-            c->resp_iov[slot][0].iov_len  = 2;
-            c->resp_iov[slot][1].iov_base = c->resp_buf[slot];
-            c->resp_iov[slot][1].iov_len  = 2;
-            submit_send_writev_simple(b, c->fd, c->resp_iov[slot], 2);
+            // Send CONNACK with error (4 bytes: header + session_present + return_code)
+            u8 connack_err[4] = {
+                0x20, 0x02, 0x00, // Header + remaining_len + session_present=0
+                (rc == MQTT_ERR_PROTOCOL) ? MQTT_CONNACK_PROTO_VERSION : MQTT_CONNACK_ID_REJECTED
+            };
+            send_buf(b, c, connack_err, 4);
             return -1;
         }
 
@@ -216,15 +213,9 @@ INLINE i32 process_mqtt_packet(struct broker *b, struct client_slot *c, const u8
         log_debug("CONNECT fd=%d slot=%d client='%.*s' keepalive=%d", c->fd, slot_idx,
                   (i32)c->client_id_len, c->client_id, c->keepalive);
 
-        // Send CONNACK success
-        u8 slot2 = client_get_resp_slot(c);
-        c->resp_buf[slot2][0]          = 0; // session present = false
-        c->resp_buf[slot2][1]          = MQTT_CONNACK_ACCEPTED;
-        c->resp_iov[slot2][0].iov_base = (void *)HDR_CONNACK;
-        c->resp_iov[slot2][0].iov_len  = 2;
-        c->resp_iov[slot2][1].iov_base = c->resp_buf[slot2];
-        c->resp_iov[slot2][1].iov_len  = 2;
-        submit_send_writev_simple(b, c->fd, c->resp_iov[slot2], 2);
+        // Send CONNACK success (4 bytes)
+        u8 connack_ok[4] = {0x20, 0x02, 0x00, MQTT_CONNACK_ACCEPTED};
+        send_buf(b, c, connack_ok, 4);
         break;
     }
 
@@ -233,11 +224,7 @@ INLINE i32 process_mqtt_packet(struct broker *b, struct client_slot *c, const u8
             return -1;
         }
         log_trace("PINGREQ fd=%d", c->fd);
-        // PINGRESP is just 2 bytes, no payload
-        u8 ping_slot = client_get_resp_slot(c);
-        c->resp_iov[ping_slot][0].iov_base = (void *)HDR_PINGRESP;
-        c->resp_iov[ping_slot][0].iov_len  = 2;
-        submit_send_writev_simple(b, c->fd, c->resp_iov[ping_slot], 1);
+        send_static(b, c, HDR_PINGRESP, 2);
         break;
     }
 
@@ -299,7 +286,7 @@ INLINE i32 process_mqtt_packet(struct broker *b, struct client_slot *c, const u8
 
         u8 return_codes[MQTT_MAX_FILTERS];
         for (u16 i = 0; i < sub_pkt.filter_count; i++) {
-            i32 sub_rc      = sub_add(b, (u32)slot_idx, sub_pkt.filters[i].topic.ptr,
+            i32 sub_rc      = sub_add(b, (u32)slot_idx, c->generation, sub_pkt.filters[i].topic.ptr,
                                       sub_pkt.filters[i].topic.len, sub_pkt.filters[i].qos);
             return_codes[i] = (sub_rc == 0) ? sub_pkt.filters[i].qos : MQTT_SUBACK_FAILURE;
 
@@ -314,13 +301,10 @@ INLINE i32 process_mqtt_packet(struct broker *b, struct client_slot *c, const u8
                       sub_pkt.filters[i].qos, return_codes[i]);
         }
 
-        // Encode SUBACK into resp_buf: [0x90, remaining_len, pkt_id_hi, pkt_id_lo, return_codes...]
-        u8 suback_slot = client_get_resp_slot(c);
-        u32 suback_len =
-            mqtt_encode_suback(c->resp_buf[suback_slot], sub_pkt.packet_id, return_codes, sub_pkt.filter_count);
-        c->resp_iov[suback_slot][0].iov_base = c->resp_buf[suback_slot];
-        c->resp_iov[suback_slot][0].iov_len  = suback_len;
-        submit_send_writev_simple(b, c->fd, c->resp_iov[suback_slot], 1);
+        // Encode SUBACK into temp buffer and send via async io_uring
+        u8 suback_buf[16]; // Max: 2 header + 2 pkt_id + 10 return codes
+        u32 suback_len = mqtt_encode_suback(suback_buf, sub_pkt.packet_id, return_codes, sub_pkt.filter_count);
+        send_buf(b, c, suback_buf, suback_len);
         break;
     }
 
@@ -342,9 +326,8 @@ INLINE i32 process_mqtt_packet(struct broker *b, struct client_slot *c, const u8
                       (i32)unsub_pkt.filters[i].len, (const char *)unsub_pkt.filters[i].ptr);
         }
 
-        // Send UNSUBACK using writev
-        struct iovec *unsuback_iov = client_setup_resp_pkt(c, HDR_UNSUBACK, unsub_pkt.packet_id);
-        submit_send_writev_simple(b, c->fd, unsuback_iov, 2);
+        // Send UNSUBACK (4 bytes: header + packet_id)
+        send_unsuback(b, c, unsub_pkt.packet_id);
         break;
     }
 
@@ -433,8 +416,10 @@ INLINE i32 process_mqtt_packet(struct broker *b, struct client_slot *c, const u8
         pctx.subscriber_count = 0;
         memset(pctx.sent_bitmap, 0, sizeof(pctx.sent_bitmap));
 
-        // Fan-out to matching subscribers
-        trie_match(&b->trie, pub_pkt.topic.ptr, pub_pkt.topic.len, publish_node_cb, &pctx);
+        // Fan-out to matching subscribers (collect mode - no callback overhead)
+        struct trie_match_result matches;
+        trie_match_collect(&b->trie, pub_pkt.topic.ptr, pub_pkt.topic.len, &matches);
+        process_publish_matches(b, &pctx, &matches);
 
         // Release base reference. If this brings refcount to 0, all sends either
         // failed or there were no subscribers - free the stolen buffer and message.

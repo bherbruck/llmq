@@ -199,6 +199,8 @@ INLINE void fsm_sub_pubcomp_received(struct broker *b, struct client_slot *sub,
 // Either retries with DUP=1 or gives up and releases reference.
 INLINE void fsm_sub_timeout(struct broker *b, struct client_slot *sub,
                             struct inflight_msg *inf, u32 slot_idx) {
+    (void)slot_idx; // Used only for PUBLISH retransmit
+
     // Check if we should give up
     if (inf->dup_count >= LLMQ_MAX_RETRIES) {
         // Max retries reached - give up
@@ -208,11 +210,17 @@ INLINE void fsm_sub_timeout(struct broker *b, struct client_slot *sub,
         return;
     }
 
-    // Retry with DUP flag
+    // Retry based on current state
     inf->dup_count++;
     inf->deadline = b->now + LLMQ_INFLIGHT_TIMEOUT_MS;
 
-    // Prepare new send with DUP=1
+    if (inf->state == INFLIGHT_WAIT_PUBCOMP) {
+        // QoS 2: Already received PUBREC, retransmit PUBREL (not PUBLISH)
+        send_pubrel(b, sub, inf->packet_id);
+        return;
+    }
+
+    // QoS 1 (WAIT_PUBACK) or QoS 2 (WAIT_PUBREC): retransmit PUBLISH with DUP=1
     i32 sd_idx = msg_prepare_send(b, inf->msg_idx, inf->packet_id, inf->qos, 1,
                                   slot_idx, sub->generation);
     if (unlikely(sd_idx < 0)) {

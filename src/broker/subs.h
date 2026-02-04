@@ -11,17 +11,17 @@
 // Subscription Management (uses trie)
 // =============================================================================
 
-// Add subscription for a slot
+// Add subscription for a slot with generation for slot-reuse detection
 // Returns: 0 on success, -1 on failure
-INLINE i32 sub_add(struct broker *b, u32 slot_idx, const u8 *topic, u16 topic_len, u8 qos) {
+INLINE i32 sub_add(struct broker *b, u32 slot_idx, u8 gen, const u8 *topic, u16 topic_len, u8 qos) {
     (void)qos; // TODO: Track QoS per subscription in trie or slot
 
     if (topic_len == 0) {
         return -1;
     }
 
-    // Add to topic trie (uses slot index, not fd)
-    return trie_subscribe(&b->trie, topic, topic_len, slot_idx);
+    // Add to topic trie with generation (for slot-reuse validation during fan-out)
+    return trie_subscribe(&b->trie, topic, topic_len, slot_idx, gen);
 }
 
 // Remove subscription for a slot
