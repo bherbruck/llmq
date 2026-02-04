@@ -92,17 +92,19 @@ INLINE u32 steal_recv_buffer(struct broker *b, struct client_slot *pub, u32 pack
     // Steal the publisher's buffer
     *out_stolen_idx = pub->recv_buf_idx;
 
-    // Copy remaining pipelined data to new buffer
+    // Copy remaining pipelined data to new buffer (starts at recv_start + packet_len)
     // This prevents loss of subsequent packets that arrived in the same recv
     u32 remaining = (pub->recv_len > packet_len) ? (pub->recv_len - packet_len) : 0;
     if (remaining > 0) {
         u8 *old_buf = buf_pool_get(&b->recv_pool, pub->recv_buf_idx);
         u8 *new_buf = buf_pool_get(&b->recv_pool, new_buf_idx);
-        memcpy(new_buf, old_buf + packet_len, remaining);
+        // Data is at recv_start offset, packet_len bytes consumed, copy rest
+        memcpy(new_buf, old_buf + pub->recv_start + packet_len, remaining);
     }
 
-    // Give the publisher the fresh buffer with remaining data
+    // Give the publisher the fresh buffer with remaining data at offset 0
     pub->recv_buf_idx = new_buf_idx;
+    pub->recv_start   = 0;         // New buffer starts at 0
     pub->recv_len     = remaining; // Preserve pipelined data
 
     b->stolen_buffers++;
@@ -422,6 +424,9 @@ INLINE i32 process_mqtt_packet(struct broker *b, struct client_slot *c, const u8
         struct trie_match_result matches;
         trie_match_collect(&b->trie, pub_pkt.topic.ptr, pub_pkt.topic.len, &matches);
         process_publish_matches(b, &pctx, &matches);
+
+        // Flush all prepared SQEs with single atomic (batched submission)
+        ring_flush_sqes(&b->ring);
 
         // Release base reference. If this brings refcount to 0, all sends either
         // failed or there were no subscribers - free the stolen buffer and message.

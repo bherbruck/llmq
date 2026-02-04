@@ -80,6 +80,9 @@ i32 ring_init(struct ring *r, u32 entries, bool use_sqpoll, u32 sq_thread_idle_m
     r->cq_mask = *(u32 *)(cq_ptr + p.cq_off.ring_mask);
     r->cqes    = (struct io_uring_cqe *)(cq_ptr + p.cq_off.cqes);
 
+    // Initialize local SQ tail for batched submission
+    r->sq_tail_local = *r->sq_tail;
+
     // Initialize local CQ head/tail for batched advance
     r->cq_head_local = *r->cq_head;
     r->cq_tail_local = *r->cq_tail;

@@ -13,15 +13,19 @@
 // io_uring Submit Operations
 // =============================================================================
 
-// Get SQE, flushing to kernel if full (simple non-blocking flush)
+// Get SQE, flushing to kernel if full
 INLINE struct io_uring_sqe *get_sqe_with_flush(struct broker *b) {
     struct io_uring_sqe *sqe = ring_get_sqe(&b->ring);
     if (likely(sqe))
         return sqe;
 
-    // SQ full - flush pending SQEs to kernel (non-blocking) - rare path
+    // SQ full - flush local tail to kernel and try again
+    ring_flush_sqes(&b->ring);
+
+    // Non-blocking submit to wake SQPOLL if needed
     ring_submit(&b->ring, 0);
 
+    // Try once more - if still full, return NULL (caller handles backpressure)
     return ring_get_sqe(&b->ring);
 }
 
@@ -41,6 +45,21 @@ INLINE void submit_accept(struct broker *b) {
 #define RECV_CTX_SLOT(ctx) ((ctx) & 0xFFFFFF)
 #define RECV_CTX_GEN(ctx)  ((u8)((ctx) >> 24))
 
+// Compact recv buffer if needed (only compact when >50% wasted space)
+// Returns true if compaction happened
+INLINE bool maybe_compact_recv_buf(struct broker *b, struct client_slot *c) {
+    // Compact when: start > half buffer AND we have data
+    if (c->recv_start > b->recv_pool.buf_size / 2 && c->recv_len > 0) {
+        u8 *recv_buf = client_recv_buf(c, &b->recv_pool);
+        if (recv_buf) {
+            memmove(recv_buf, recv_buf + c->recv_start, c->recv_len);
+            c->recv_start = 0;
+            return true;
+        }
+    }
+    return false;
+}
+
 // Submit recv for client, returns true on success, false if SQ full (caller should retry)
 INLINE bool submit_recv_internal(struct broker *b, struct client_slot *c) {
     struct io_uring_sqe *sqe = get_sqe_with_flush(b);
@@ -52,8 +71,13 @@ INLINE bool submit_recv_internal(struct broker *b, struct client_slot *c) {
         log_error("No recv buffer for fd=%d", c->fd);
         return true; // Not an SQ issue, don't retry
     }
-    u8 *buf   = recv_buf + c->recv_len;
-    u32 space = b->recv_pool.buf_size - c->recv_len;
+
+    // Compact if needed before submitting recv (ensures contiguous space)
+    maybe_compact_recv_buf(b, c);
+
+    // Write at end of valid data: recv_start + recv_len
+    u8 *buf   = recv_buf + c->recv_start + c->recv_len;
+    u32 space = b->recv_pool.buf_size - c->recv_start - c->recv_len;
     ring_prep_recv(sqe, c->fd, buf, space, 0);
     // Store (slot_idx, generation) in context to detect stale CQEs after slot reuse
     u32 slot_idx   = (u32)(c - b->clients);
@@ -86,6 +110,7 @@ INLINE void submit_send(struct broker *b, i32 fd, const u8 *buf, u32 len) {
 
 // Submit zero-copy send using send descriptor's scatter-gather iovecs
 // Context is the send_desc_pool index for completion handling
+// NOTE: Does NOT flush SQEs - caller must call ring_flush_sqes() when batch is complete
 INLINE void submit_send_zc(struct broker *b, i32 fd, u32 send_desc_idx) {
     struct io_uring_sqe *sqe = get_sqe_with_flush(b);
     if (!sqe) {
@@ -128,7 +153,7 @@ INLINE void submit_send_zc(struct broker *b, i32 fd, u32 send_desc_idx) {
 
     ring_prep_writev(sqe, fd, sd->iov, nr_vecs, 0);
     sqe->user_data = make_user_data(OP_SEND_ZC, (u32)fd, send_desc_idx);
-    ring_submit_sqe(&b->ring);
+    // NOTE: Do NOT flush here - let batch complete first for performance
 }
 
 // =============================================================================
@@ -297,8 +322,11 @@ INLINE void process_recv_buffer(struct broker *b, struct client_slot *c) {
         return;
     }
 
+    // Read from recv_start offset
+    u8 *data = recv_buf + c->recv_start;
+
     while (c->recv_len > 0) {
-        i32 packet_len = mqtt_packet_complete(recv_buf, c->recv_len);
+        i32 packet_len = mqtt_packet_complete(data, c->recv_len);
 
         if (packet_len == MQTT_INCOMPLETE) {
             break;
@@ -313,13 +341,13 @@ INLINE void process_recv_buffer(struct broker *b, struct client_slot *c) {
         // Save buffer index to detect if buffer was stolen during processing
         u32 buf_idx_before = c->recv_buf_idx;
 
-        i32 consumed = process_mqtt_packet(b, c, recv_buf, (u32)packet_len);
+        i32 consumed = process_mqtt_packet(b, c, data, (u32)packet_len);
 
         if (consumed < 0) {
             // Negative return = close connection
             // Only warn if it wasn't a clean DISCONNECT (type=14)
             struct mqtt_fixed_header hdr;
-            mqtt_parse_fixed_header(recv_buf, c->recv_len, &hdr);
+            mqtt_parse_fixed_header(data, c->recv_len, &hdr);
             if (hdr.type != MQTT_DISCONNECT) {
                 log_warn("Packet error fd=%d type=%d, closing", c->fd, hdr.type);
             }
@@ -330,20 +358,21 @@ INLINE void process_recv_buffer(struct broker *b, struct client_slot *c) {
         // Check if buffer was stolen during PUBLISH processing
         if (c->recv_buf_idx != buf_idx_before) {
             // Buffer was stolen - remaining data already copied to new buffer at offset 0
-            // recv_len already contains the correct remaining length
-            // Re-fetch recv_buf and continue processing
+            // recv_len already contains the correct remaining length, recv_start reset to 0
+            c->recv_start = 0;
+            // Re-fetch recv_buf and data pointer for new buffer
             recv_buf = client_recv_buf(c, &b->recv_pool);
             if (!recv_buf) {
                 return;
             }
+            data = recv_buf;
             continue;
         }
 
-        u32 remaining = c->recv_len - (u32)consumed;
-        if (remaining > 0) {
-            memmove(recv_buf, recv_buf + consumed, remaining);
-        }
-        c->recv_len = remaining;
+        // Advance read pointer instead of memmove (O(1) instead of O(n))
+        c->recv_start += (u32)consumed;
+        c->recv_len   -= (u32)consumed;
+        data          += consumed;
     }
 }
 
@@ -619,7 +648,8 @@ INLINE i32 broker_run(struct broker *b) {
         // Update current time (used for deadlines)
         b->now = now_ms();
 
-        // Submit pending SQEs without blocking
+        // Flush any batched SQEs to kernel, then submit
+        ring_flush_sqes(&b->ring);
         i32 rc = ring_submit(&b->ring, 0);
         if (rc < 0 && rc != -EINTR) {
             log_error("io_uring_enter failed: %d", rc);

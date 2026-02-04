@@ -94,7 +94,8 @@ struct client_slot {
 
     // Receive buffer (dynamically allocated)
     u32 recv_buf_idx;          // Index into recv buffer pool (BUF_POOL_INVALID if none)
-    u32 recv_len;              // Bytes in receive buffer
+    u32 recv_start;            // Offset where unread data begins (allows no-copy advance)
+    u32 recv_len;              // Bytes of valid data starting at recv_start
     u32 orphaned_recv_buf_idx; // Buffer from prev connection awaiting stale recv CQE
 
     // Scratch area for immediate protocol responses
@@ -166,6 +167,7 @@ INLINE void client_init(struct client_slot *c, i32 fd, u32 recv_buf_idx, u16 max
     c->recv_pending     = 0; // No recv in-flight yet
     c->last_active      = 0;
     c->recv_buf_idx     = recv_buf_idx;
+    c->recv_start       = 0;
     c->recv_len         = 0;
     // Don't reset orphaned_recv_buf_idx - it may have a buffer waiting for stale CQE
     c->pending_head     = 0;
@@ -254,6 +256,7 @@ INLINE void client_set_identity(struct client_slot *c, const u8 *id, u8 len) {
 INLINE void client_go_dormant(struct client_slot *c) {
     c->state        = CLIENT_DORMANT;
     c->fd           = -1;
+    c->recv_start   = 0;
     c->recv_len     = 0;
     c->recv_buf_idx = BUF_POOL_INVALID; // Caller should have freed it
     // Session data (subscriptions, pending) preserved
@@ -266,6 +269,7 @@ INLINE void client_free(struct client_slot *c) {
     c->fd             = -1;
     c->client_id_len  = 0;
     c->client_id_hash = 0;
+    c->recv_start     = 0;
     c->recv_len       = 0;
     c->recv_buf_idx   = BUF_POOL_INVALID;
     c->pending_head   = 0;

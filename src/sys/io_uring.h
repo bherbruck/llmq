@@ -210,6 +210,7 @@ struct ring {
     u32 *sq_array;
     u32 sq_mask;
     u32 sq_entries;
+    u32 sq_tail_local; // Local tail for batched submission (not visible to kernel until flush)
     struct io_uring_sqe *sqes;
 
     // Completion queue
@@ -251,9 +252,10 @@ i32 ring_init(struct ring *r, u32 entries, bool use_sqpoll, u32 sq_thread_idle_m
 void ring_cleanup(struct ring *r);
 
 // Get next SQE (returns NULL if SQ is full)
+// Uses local tail - not visible to kernel until flushed
 INLINE struct io_uring_sqe *ring_get_sqe(struct ring *r) {
     u32 head = io_uring_smp_load_acquire(r->sq_head);
-    u32 tail = *r->sq_tail;
+    u32 tail = r->sq_tail_local;
     u32 next = tail + 1;
 
     if (unlikely(next - head > r->sq_entries)) {
@@ -267,19 +269,32 @@ INLINE struct io_uring_sqe *ring_get_sqe(struct ring *r) {
         ((u64 *)sqe)[i] = 0;
     }
 
+    // Prepare sq_array entry and advance local tail
+    r->sq_array[tail & r->sq_mask] = tail & r->sq_mask;
+    r->sq_tail_local = next;
+
     return sqe;
 }
 
-// Submit SQE (call after filling it in)
-INLINE void ring_submit_sqe(struct ring *r) {
-    u32 tail                       = *r->sq_tail;
-    r->sq_array[tail & r->sq_mask] = tail & r->sq_mask;
-    io_uring_smp_store_release(r->sq_tail, tail + 1);
+// Flush all prepared SQEs to kernel with single atomic store-release
+// Call this after preparing a batch of SQEs
+INLINE void ring_flush_sqes(struct ring *r) {
+    u32 local_tail = r->sq_tail_local;
+    u32 kernel_tail = *r->sq_tail;
+    if (local_tail != kernel_tail) {
+        io_uring_smp_store_release(r->sq_tail, local_tail);
+    }
 }
 
-// Get number of pending SQEs
+// Submit SQE (prepare + immediate flush) - use for single SQEs
+// Use for non-batch submissions (recv, accept, close, etc.)
+INLINE void ring_submit_sqe(struct ring *r) {
+    ring_flush_sqes(r);
+}
+
+// Get number of pending SQEs (includes unflushed local SQEs)
 INLINE u32 ring_sq_pending(struct ring *r) {
-    return *r->sq_tail - io_uring_smp_load_acquire(r->sq_head);
+    return r->sq_tail_local - io_uring_smp_load_acquire(r->sq_head);
 }
 
 // Check if SQPOLL kernel thread needs wakeup
