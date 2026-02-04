@@ -405,8 +405,8 @@ INLINE i32 client_inflight_alloc(struct client_slot *c, u8 qos, u32 msg_idx, u64
     c->inflight_count++;
     c->inflight_free_hint = (slot + 1) & c->inflight_mask;
 
-    // Insert into hash table for O(1) lookup
-    inflight_hash_insert(c, packet_id, slot);
+    // Skip hash table for outgoing - direct indexing works since we control packet_id
+    // Hash table only needed for incoming messages with arbitrary packet_ids
 
     // Advance generation when we wrap around slot 0
     if (slot == 0) {
@@ -502,8 +502,11 @@ INLINE struct inflight_msg *client_inflight_find(struct client_slot *c, u16 pack
 // Note: Caller must handle msg_pool refcount and send_desc_pool separately
 INLINE void client_inflight_free(struct client_slot *c, struct inflight_msg *msg) {
     if (msg->state != INFLIGHT_FREE) {
-        // Remove from hash table first (while packet_id is still valid)
-        inflight_hash_remove(c, msg->packet_id);
+        // Only remove from hash table for incoming messages (direction=1)
+        // Outgoing messages use direct indexing, not hash table
+        if (msg->direction == 1) {
+            inflight_hash_remove(c, msg->packet_id);
+        }
         msg->msg_idx       = MSG_POOL_INVALID;
         msg->send_desc_idx = SEND_DESC_INVALID;
         msg->state         = INFLIGHT_FREE;
