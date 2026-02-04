@@ -36,22 +36,41 @@ INLINE void submit_accept(struct broker *b) {
     ring_submit_sqe(&b->ring);
 }
 
-INLINE void submit_recv(struct broker *b, struct client_slot *c) {
+// Encode slot_idx (24 bits) and generation (8 bits) into 32-bit context
+#define MAKE_RECV_CTX(slot, gen) (((u32)(gen) << 24) | ((slot) & 0xFFFFFF))
+#define RECV_CTX_SLOT(ctx) ((ctx) & 0xFFFFFF)
+#define RECV_CTX_GEN(ctx)  ((u8)((ctx) >> 24))
+
+// Submit recv for client, returns true on success, false if SQ full (caller should retry)
+INLINE bool submit_recv_internal(struct broker *b, struct client_slot *c) {
     struct io_uring_sqe *sqe = get_sqe_with_flush(b);
     if (!sqe) {
-        log_error("SQ full, can't submit recv");
-        return;
+        return false; // SQ full - caller should retry later
     }
     u8 *recv_buf = client_recv_buf(c, &b->recv_pool);
     if (!recv_buf) {
         log_error("No recv buffer for fd=%d", c->fd);
-        return;
+        return true; // Not an SQ issue, don't retry
     }
     u8 *buf   = recv_buf + c->recv_len;
     u32 space = b->recv_pool.buf_size - c->recv_len;
     ring_prep_recv(sqe, c->fd, buf, space, 0);
-    sqe->user_data = make_user_data(OP_RECV, (u32)c->fd, 0);
+    // Store (slot_idx, generation) in context to detect stale CQEs after slot reuse
+    u32 slot_idx   = (u32)(c - b->clients);
+    u32 ctx        = MAKE_RECV_CTX(slot_idx, c->generation);
+    sqe->user_data = make_user_data(OP_RECV, (u32)c->fd, ctx);
+    c->recv_pending = 1; // Mark recv in-flight (kernel may write to buffer)
     ring_submit_sqe(&b->ring);
+    return true;
+}
+
+// Submit recv, queueing for retry if SQ is full
+INLINE void submit_recv(struct broker *b, struct client_slot *c) {
+    if (!submit_recv_internal(b, c)) {
+        // SQ full - queue for retry after CQEs are processed
+        u32 slot_idx = (u32)(c - b->clients);
+        recv_retry_enqueue(b, slot_idx);
+    }
 }
 
 INLINE void submit_send(struct broker *b, i32 fd, const u8 *buf, u32 len) {
@@ -65,47 +84,86 @@ INLINE void submit_send(struct broker *b, i32 fd, const u8 *buf, u32 len) {
     ring_submit_sqe(&b->ring);
 }
 
-// Submit send with context for tracking inflight buffers (QoS 1/2)
-INLINE void submit_send_ctx(struct broker *b, i32 fd, const u8 *buf, u32 len, u32 ctx) {
+// Submit zero-copy send using send descriptor's scatter-gather iovecs
+// Context is the send_desc_pool index for completion handling
+INLINE void submit_send_zc(struct broker *b, i32 fd, u32 send_desc_idx) {
     struct io_uring_sqe *sqe = get_sqe_with_flush(b);
     if (!sqe) {
-        log_error("SQ full, can't submit send");
+        log_debug("SQ full, dropping zc send fd=%d", fd);
+        b->msgs_dropped++;
+        b->drops_sq_full++;
+        // Must clean up: decrement refcount, free send_desc
+        struct send_desc *sd = send_desc_pool_get(&b->send_desc_pool, send_desc_idx);
+        if (sd && sd->msg_idx != MSG_POOL_INVALID) {
+            u32 new_ref = msg_pool_unref(&b->msg_pool, sd->msg_idx);
+            if (new_ref == 0) {
+                // Last reference - free the stolen buffer
+                struct canonical_msg *msg = msg_pool_get(&b->msg_pool, sd->msg_idx);
+                if (msg && msg->buf_idx != MSG_POOL_INVALID) {
+                    buf_pool_free(&b->recv_pool, msg->buf_idx);
+                }
+                msg_pool_free(&b->msg_pool, sd->msg_idx);
+            }
+        }
+        send_desc_pool_free(&b->send_desc_pool, send_desc_idx);
         return;
     }
-    ring_prep_send(sqe, fd, buf, len, 0);
-    sqe->user_data = make_user_data(OP_SEND, (u32)fd, ctx);
+
+    struct send_desc *sd = send_desc_pool_get(&b->send_desc_pool, send_desc_idx);
+    if (!sd) {
+        log_error("Invalid send_desc_idx: %u", send_desc_idx);
+        return;
+    }
+
+    // Determine number of iovecs (4 for QoS > 0, 3 for QoS 0 since pkt_id iov is empty)
+    u32 nr_vecs = (sd->sub_qos > 0) ? 4 : 3;
+    if (sd->sub_qos == 0) {
+        // For QoS 0, skip the packet_id iovec by shifting payload
+        // Actually, iov[2] has len=0 for QoS 0, so we can send all 4
+        nr_vecs = 4;
+    }
+
+    ring_prep_writev(sqe, fd, sd->iov, nr_vecs, 0);
+    sqe->user_data = make_user_data(OP_SEND_ZC, (u32)fd, send_desc_idx);
     ring_submit_sqe(&b->ring);
 }
 
-// Submit send with shared message buffer (QoS 0 zero-copy fan-out)
-// Context is the msg_pool index for refcount tracking
-INLINE void submit_send_shared(struct broker *b, i32 fd, const u8 *buf, u32 len, u32 msg_idx) {
-    struct io_uring_sqe *sqe = get_sqe_with_flush(b);
-    if (!sqe) {
-        log_error("SQ full, can't submit shared send");
-        // Decrement refcount since we won't get a CQE
-        msg_pool_unref(&b->msg_pool, msg_idx);
-        return;
+// Send simple scatter-gather response synchronously (non-blocking)
+// Used for protocol responses (CONNACK, PUBACK, etc.)
+// Using synchronous send prevents fd-reuse race where async send would
+// execute after fd is closed and reused for a different client.
+// MSG_DONTWAIT ensures we don't block if socket buffer is full.
+INLINE void submit_send_writev_simple(struct broker *b, i32 fd, struct iovec *iov, u32 nr_vecs) {
+    struct msghdr msg = {
+        .msg_name       = NULL,
+        .msg_namelen    = 0,
+        .msg_iov        = iov,
+        .msg_iovlen     = nr_vecs,
+        .msg_control    = NULL,
+        .msg_controllen = 0,
+        .msg_flags      = 0,
+    };
+    i64 rc = sys_sendmsg(fd, &msg, MSG_DONTWAIT);
+    if (rc > 0) {
+        b->bytes_sent += (u64)rc;
     }
-    ring_prep_send(sqe, fd, buf, len, 0);
-    sqe->user_data = make_user_data(OP_SEND_SHARED, (u32)fd, msg_idx);
-    ring_submit_sqe(&b->ring);
+    // If EAGAIN/EWOULDBLOCK (-11), socket buffer full - client too slow, ignore
+    // If other error, connection broken - recv will handle close
+    (void)b; // Suppress unused warning when logging disabled
 }
 
-// Submit scatter-gather send for QoS 1/2 (3 iovecs: header+topic, packet_id, payload)
-// Context encodes slot_idx + inflight_idx + qos for ACK handling
-INLINE void submit_send_writev(struct broker *b, i32 fd, struct iovec *iov, u32 ctx) {
-    struct io_uring_sqe *sqe = get_sqe_with_flush(b);
-    if (!sqe) {
-        log_error("SQ full, can't submit writev");
-        return;
-    }
-    ring_prep_writev(sqe, fd, iov, 3, 0);
-    sqe->user_data = make_user_data(OP_SEND_WRITEV, (u32)fd, ctx);
-    ring_submit_sqe(&b->ring);
-}
-
+// Submit close and mark client as CLOSING to prevent new operations on this fd.
+// This prevents the fd-reuse race where a recv CQE arrives after fd is closed
+// and reused for a new connection.
 INLINE void submit_close(struct broker *b, i32 fd) {
+    // Mark client as CLOSING FIRST to prevent new recv/send submissions.
+    // This is critical: without it, handle_recv might submit another recv
+    // after we queue the close, creating a race with fd reuse.
+    struct client_slot *c = broker_get_client_by_fd(b, fd);
+    if (c && c->state == CLIENT_ACTIVE) {
+        c->state = CLIENT_CLOSING;
+    }
+
     struct io_uring_sqe *sqe = get_sqe_with_flush(b);
     if (!sqe) {
         log_error("SQ full, can't submit close");
@@ -116,7 +174,7 @@ INLINE void submit_close(struct broker *b, i32 fd) {
     ring_submit_sqe(&b->ring);
 }
 
-// Include handler after submit_send is defined
+// Include handler after submit functions are defined
 #include "broker/handler.h"
 
 // =============================================================================
@@ -175,6 +233,9 @@ INLINE void process_recv_buffer(struct broker *b, struct client_slot *c) {
             return;
         }
 
+        // Save buffer index to detect if buffer was stolen during processing
+        u32 buf_idx_before = c->recv_buf_idx;
+
         i32 consumed = process_mqtt_packet(b, c, recv_buf, (u32)packet_len);
 
         if (consumed < 0) {
@@ -189,6 +250,18 @@ INLINE void process_recv_buffer(struct broker *b, struct client_slot *c) {
             return;
         }
 
+        // Check if buffer was stolen during PUBLISH processing
+        if (c->recv_buf_idx != buf_idx_before) {
+            // Buffer was stolen - remaining data already copied to new buffer at offset 0
+            // recv_len already contains the correct remaining length
+            // Re-fetch recv_buf and continue processing
+            recv_buf = client_recv_buf(c, &b->recv_pool);
+            if (!recv_buf) {
+                return;
+            }
+            continue;
+        }
+
         u32 remaining = c->recv_len - (u32)consumed;
         if (remaining > 0) {
             memmove(recv_buf, recv_buf + consumed, remaining);
@@ -198,10 +271,34 @@ INLINE void process_recv_buffer(struct broker *b, struct client_slot *c) {
 }
 
 INLINE void handle_recv(struct broker *b, struct io_uring_cqe *cqe) {
-    i32 fd                = (i32)ud_fd(cqe->user_data);
-    struct client_slot *c = broker_get_client_by_fd(b, fd);
+    i32 fd       = (i32)ud_fd(cqe->user_data);
+    u32 ctx      = ud_ctx(cqe->user_data);
+    u32 slot_idx = RECV_CTX_SLOT(ctx);
+    u8 cqe_gen   = RECV_CTX_GEN(ctx);
 
-    if (!c || c->state != CLIENT_ACTIVE) {
+    // Use slot_idx from user_data to find the slot
+    struct client_slot *c = broker_get_client(b, slot_idx);
+    if (!c) {
+        return;
+    }
+
+    // Check generation to detect stale CQEs from previous slot use.
+    // If generation doesn't match, this recv was submitted before the slot was reused.
+    if (c->generation != cqe_gen) {
+        // Stale CQE - free the orphaned buffer that was saved during slot cleanup
+        if (c->orphaned_recv_buf_idx != BUF_POOL_INVALID) {
+            buf_pool_free(&b->recv_pool, c->orphaned_recv_buf_idx);
+            c->orphaned_recv_buf_idx = BUF_POOL_INVALID;
+        }
+        return;
+    }
+
+    // Clear recv_pending - the recv has completed (success or error)
+    c->recv_pending = 0;
+
+    // Check state after clearing recv_pending
+    if (c->state != CLIENT_ACTIVE) {
+        // Client is CLOSING/FREE - don't process data
         return;
     }
 
@@ -230,67 +327,80 @@ INLINE void handle_send(struct broker *b, struct io_uring_cqe *cqe) {
 
     if (cqe->res < 0) {
         log_debug("send error fd=%d err=%d", fd, cqe->res);
-        // Connection broken - close it
-        struct client_slot *c = broker_get_client_by_fd(b, fd);
-        if (c && c->state == CLIENT_ACTIVE) {
-            submit_close(b, fd);
-        }
+        // Don't close on send error - recv will detect the broken connection.
+        // Closing here risks closing a reused fd: if the old connection's close
+        // completed and fd was reused for a new client, we'd close the new client.
     } else {
         b->bytes_sent += (u64)cqe->res;
     }
 }
 
-// Handle completion of scatter-gather send (QoS 1/2 zero-copy fan-out)
-INLINE void handle_send_writev(struct broker *b, struct io_uring_cqe *cqe) {
-    i32 fd  = (i32)ud_fd(cqe->user_data);
-    u32 ctx = ud_ctx(cqe->user_data);
+// Handle completion of zero-copy send
+// Cleanup: free send_desc, decrement msg refcount, free stolen buffer if last ref
+INLINE void handle_send_zc(struct broker *b, struct io_uring_cqe *cqe) {
+    u32 send_desc_idx = ud_ctx(cqe->user_data);
+    i32 fd            = (i32)ud_fd(cqe->user_data);
+
+    struct send_desc *sd = send_desc_pool_get(&b->send_desc_pool, send_desc_idx);
+    if (!sd) {
+        log_error("handle_send_zc: invalid send_desc_idx %u", send_desc_idx);
+        return;
+    }
 
     if (cqe->res < 0) {
-        log_debug("writev error fd=%d err=%d", fd, cqe->res);
-        // Connection broken - close it
-        struct client_slot *c = broker_get_client_by_fd(b, fd);
-        if (c && c->state == CLIENT_ACTIVE) {
-            submit_close(b, fd);
-        }
+        log_debug("zc send error fd=%d err=%d", fd, cqe->res);
+        b->msgs_dropped++;
+        b->drops_send_failed++;
+        // Don't close on send error - recv will detect the broken connection.
+        // Closing here risks closing a reused fd.
     } else {
         b->bytes_sent += (u64)cqe->res;
     }
 
-    // For send errors, free the inflight entry (message won't be delivered)
-    if (cqe->res < 0) {
-        u32 slot_idx    = send_ctx_slot(ctx);
-        u8 inflight_idx = send_ctx_inflight(ctx);
+    // Get the canonical message for this send
+    u32 msg_idx = sd->msg_idx;
+    struct canonical_msg *msg = msg_pool_get(&b->msg_pool, msg_idx);
 
-        struct client_slot *c = broker_get_client(b, slot_idx);
-        if (c && inflight_idx < c->max_inflight) {
-            struct inflight_msg *inf = &c->inflight[inflight_idx];
-            client_inflight_free(c, inf, &b->msg_pool);
+    // Decrement reference count
+    u32 new_ref = msg_pool_unref(&b->msg_pool, msg_idx);
+
+    // If this was the last reference, free the stolen buffer and message
+    if (new_ref == 0 && msg) {
+        if (msg->buf_idx != MSG_POOL_INVALID) {
+            buf_pool_free(&b->recv_pool, msg->buf_idx);
+        }
+        msg_pool_free(&b->msg_pool, msg_idx);
+    }
+
+    // For QoS > 0, the inflight entry tracks the message for ACK handling
+    // The inflight entry is freed when ACK is received (in handler.h)
+    // Here we just unlink the send_desc from it
+    if (sd->sub_qos > 0) {
+        struct client_slot *c = broker_get_client(b, sd->slot_idx);
+        // Check generation to detect slot reuse - if slot was reused,
+        // the old inflight entries are gone and we shouldn't touch new client's inflight
+        if (c && c->generation == sd->slot_gen) {
+            // Find and unlink the inflight entry
+            for (u16 i = 0; i < c->max_inflight; i++) {
+                if (c->inflight[i].send_desc_idx == send_desc_idx) {
+                    c->inflight[i].send_desc_idx = SEND_DESC_INVALID;
+                    break;
+                }
+            }
         }
     }
-    // On success, keep inflight entry until PUBACK/PUBCOMP
-}
 
-// Handle completion of shared buffer send (QoS 0 zero-copy fan-out)
-INLINE void handle_send_shared(struct broker *b, struct io_uring_cqe *cqe) {
-    u32 msg_idx = ud_ctx(cqe->user_data);
-
-    if (cqe->res < 0) {
-        i32 fd = (i32)ud_fd(cqe->user_data);
-        log_debug("shared send error fd=%d err=%d", fd, cqe->res);
-    } else {
-        b->bytes_sent += (u64)cqe->res;
-    }
-
-    // Decrement refcount, free buffer if this was the last send
-    msg_pool_unref(&b->msg_pool, msg_idx);
+    // Free the send descriptor
+    send_desc_pool_free(&b->send_desc_pool, send_desc_idx);
 }
 
 INLINE void handle_close(struct broker *b, struct io_uring_cqe *cqe) {
     i32 fd = (i32)ud_fd(cqe->user_data);
 
     // Find slot and handle disconnect
+    // Verify fd matches to handle stale close CQEs after fd reuse
     struct client_slot *c = broker_get_client_by_fd(b, fd);
-    if (c) {
+    if (c && (c->state == CLIENT_ACTIVE || c->state == CLIENT_CLOSING) && c->fd == fd) {
         i32 slot_idx = b->fd_to_slot[fd];
         log_debug("disconnect fd=%d slot=%d clean=%d", fd, slot_idx, c->clean_session);
         if (c->clean_session) {
@@ -314,11 +424,8 @@ INLINE void dispatch_cqe(struct broker *b, struct io_uring_cqe *cqe) {
     case OP_SEND:
         handle_send(b, cqe);
         break;
-    case OP_SEND_SHARED:
-        handle_send_shared(b, cqe);
-        break;
-    case OP_SEND_WRITEV:
-        handle_send_writev(b, cqe);
+    case OP_SEND_ZC:
+        handle_send_zc(b, cqe);
         break;
     case OP_CLOSE:
         handle_close(b, cqe);
@@ -330,10 +437,71 @@ INLINE void dispatch_cqe(struct broker *b, struct io_uring_cqe *cqe) {
 }
 
 // =============================================================================
+// Recv Retry Processing
+// =============================================================================
+
+// Process pending recv retries - call after draining CQEs when SQ space is available
+// Returns number of successful retries
+INLINE u32 process_recv_retries(struct broker *b) {
+    u32 retried = 0;
+
+    while (!recv_retry_empty(b)) {
+        u32 slot_idx = recv_retry_dequeue(b);
+        if (slot_idx >= b->max_clients) {
+            break; // Invalid slot (shouldn't happen)
+        }
+
+        struct client_slot *c = &b->clients[slot_idx];
+
+        // Check if client is still active and needs recv
+        if (c->state != CLIENT_ACTIVE) {
+            continue; // Client disconnected, skip
+        }
+
+        // Check if recv is already pending (shouldn't be, but safety check)
+        if (c->recv_pending) {
+            continue; // Already has pending recv
+        }
+
+        // Try to submit recv
+        if (!submit_recv_internal(b, c)) {
+            // Still SQ full - re-enqueue and stop processing
+            recv_retry_enqueue(b, slot_idx);
+            break;
+        }
+
+        retried++;
+    }
+
+    if (retried > 0) {
+        b->recv_retries += retried;
+    }
+
+    return retried;
+}
+
+// =============================================================================
 // Main Event Loop
 // =============================================================================
 
 #define ACCEPT_BATCH 32
+
+// Log pool utilization stats
+INLINE void log_pool_stats(struct broker *b) {
+    u32 msg_used  = b->msg_pool.capacity - b->msg_pool.free_count;
+    u32 sd_used   = b->send_desc_pool.capacity - b->send_desc_pool.free_count;
+    u32 recv_used = b->recv_pool.capacity - b->recv_pool.free_count;
+    u32 retry_pending = (b->recv_retry_tail >= b->recv_retry_head)
+                            ? (b->recv_retry_tail - b->recv_retry_head)
+                            : (b->recv_retry_capacity - b->recv_retry_head + b->recv_retry_tail);
+
+    log_info("POOLS: msg=%u/%u sd=%u/%u recv=%u/%u retry=%u active=%u drops=%lu (sq=%lu fail=%lu)",
+             msg_used, b->msg_pool.capacity,
+             sd_used, b->send_desc_pool.capacity,
+             recv_used, b->recv_pool.capacity,
+             retry_pending, b->active_count, b->msgs_dropped,
+             b->drops_sq_full, b->drops_send_failed);
+}
 
 INLINE i32 broker_run(struct broker *b) {
     b->running = true;
@@ -344,6 +512,9 @@ INLINE i32 broker_run(struct broker *b) {
     }
 
     log_info("Entering event loop...");
+
+    u64 last_stats_time = 0;
+    u64 cqe_count       = 0;
 
     while (b->running) {
         i32 rc = ring_submit(&b->ring, 1);
@@ -359,6 +530,16 @@ INLINE i32 broker_run(struct broker *b) {
         while ((cqe = ring_peek_cqe(&b->ring)) != NULL) {
             dispatch_cqe(b, cqe);
             ring_cq_advance(&b->ring, 1);
+            cqe_count++;
+        }
+
+        // Process any pending recv retries now that CQEs freed SQ space
+        process_recv_retries(b);
+
+        // Log pool stats every ~5 seconds (based on CQE count as proxy for time)
+        if (cqe_count - last_stats_time > 50000) {
+            log_pool_stats(b);
+            last_stats_time = cqe_count;
         }
     }
 

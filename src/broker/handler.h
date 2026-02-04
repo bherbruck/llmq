@@ -14,79 +14,139 @@
 #include "mqtt/publish.h"
 #include "util/log.h"
 
-// Forward declare submit_send (defined in loop.h which includes this file)
+// Forward declare submit functions (defined in loop.h which includes this file)
 INLINE void submit_send(struct broker *b, i32 fd, const u8 *buf, u32 len);
-INLINE void submit_send_shared(struct broker *b, i32 fd, const u8 *buf, u32 len, u32 msg_idx);
-INLINE void submit_send_writev(struct broker *b, i32 fd, struct iovec *iov, u32 ctx);
+INLINE void submit_send_zc(struct broker *b, i32 fd, u32 send_desc_idx);
+INLINE void submit_send_writev_simple(struct broker *b, i32 fd, struct iovec *iov, u32 nr_vecs);
+
+// Static headers for zero-copy protocol responses (type<<4 | flags, remaining_len)
+static const u8 HDR_CONNACK[4]  = {0x20, 0x02, 0x00, 0x00}; // Session=0, accepted
+static const u8 HDR_PUBACK[2]   = {0x40, 0x02};
+static const u8 HDR_PUBREC[2]   = {0x50, 0x02};
+static const u8 HDR_PUBREL[2]   = {0x62, 0x02};
+static const u8 HDR_PUBCOMP[2]  = {0x70, 0x02};
+static const u8 HDR_UNSUBACK[2] = {0xB0, 0x02};
+static const u8 HDR_PINGRESP[2] = {0xD0, 0x00};
 
 // =============================================================================
-// Publish Fan-out Context
+// Zero-Copy Publish Context
 // =============================================================================
 
+// Context for publishing - tracks stolen buffer and metadata
 struct publish_ctx {
     struct broker *broker;
-    struct mqtt_publish *pub;
+    u32 msg_idx;                    // Index into canonical_msg pool
+    u32 stolen_buf_idx;             // Index of stolen recv buffer
+    u8 *stolen_buf;                 // Pointer to stolen buffer data
     u64 sent_bitmap[TRIE_FD_SLOTS]; // Track which slots we've sent to
-    u32 msg_idx;                    // Shared msg_buffer index (QoS 0 only)
-    u32 msg_len;                    // Encoded message length
-    u8 *msg_data;                   // Pointer to encoded data
+    u32 subscriber_count;           // Number of subscribers we're sending to
 };
 
-// Forward QoS 0 publish using shared buffer (zero-copy fan-out)
-// The shared buffer is reference-counted, freed when all sends complete
-static i32 forward_qos0_shared(struct broker *b, struct client_slot *c, struct publish_ctx *pctx) {
-    // Increment refcount before submitting send
-    msg_pool_ref(&b->msg_pool, pctx->msg_idx);
-    submit_send_shared(b, c->fd, pctx->msg_data, pctx->msg_len, pctx->msg_idx);
-    return 0;
+// =============================================================================
+// Buffer Stealing
+// =============================================================================
+
+// Steal the publisher's recv buffer and give them a fresh one
+// packet_len: size of the PUBLISH packet being stolen (remaining data is copied to new buffer)
+// Returns: new recv_buf_idx for publisher, or BUF_POOL_INVALID on failure
+INLINE u32 steal_recv_buffer(struct broker *b, struct client_slot *pub, u32 packet_len,
+                              u32 *out_stolen_idx) {
+    // Try to allocate a fresh buffer for the publisher
+    u32 new_buf_idx = buf_pool_alloc(&b->recv_pool);
+    if (new_buf_idx == BUF_POOL_INVALID) {
+        return BUF_POOL_INVALID; // No buffers available, can't steal
+    }
+
+    // Steal the publisher's buffer
+    *out_stolen_idx = pub->recv_buf_idx;
+
+    // Copy remaining pipelined data to new buffer
+    // This prevents loss of subsequent packets that arrived in the same recv
+    u32 remaining = (pub->recv_len > packet_len) ? (pub->recv_len - packet_len) : 0;
+    if (remaining > 0) {
+        u8 *old_buf = buf_pool_get(&b->recv_pool, pub->recv_buf_idx);
+        u8 *new_buf = buf_pool_get(&b->recv_pool, new_buf_idx);
+        memcpy(new_buf, old_buf + packet_len, remaining);
+    }
+
+    // Give the publisher the fresh buffer with remaining data
+    pub->recv_buf_idx = new_buf_idx;
+    pub->recv_len     = remaining; // Preserve pipelined data
+
+    b->stolen_buffers++;
+    return new_buf_idx;
 }
 
-// Forward QoS 1/2 publish using scatter-gather with shared buffer
-// Each subscriber gets unique packet_id inserted via writev
-static i32 forward_qos12_writev(struct broker *b, u32 slot_idx, struct client_slot *c,
-                                struct publish_ctx *pctx, u8 effective_qos) {
-    u16 packet_id = 0;
-    i32 inf_idx   = client_inflight_alloc_shared(c, effective_qos, pctx->msg_idx, &packet_id);
+// =============================================================================
+// Late Materialization - Build PUBLISH at Send Time
+// =============================================================================
 
-    if (inf_idx < 0) {
-        b->msgs_dropped++;
-        b->drops_inflight_full++;
+// Forward publish to a single subscriber using zero-copy
+// Materializes PUBLISH header on-the-fly, uses scatter-gather for topic/payload
+static i32 forward_publish_zc(struct broker *b, u32 slot_idx, struct client_slot *sub,
+                               struct publish_ctx *pctx, u8 sub_qos) {
+    struct canonical_msg *msg = msg_pool_get(&b->msg_pool, pctx->msg_idx);
+    if (!msg) {
         return -1;
     }
 
-    struct inflight_msg *inf = &c->inflight[inf_idx];
-
-    // Increment refcount for this subscriber
-    msg_pool_ref(&b->msg_pool, pctx->msg_idx);
-
-    // Setup scatter-gather iovecs
-    client_inflight_setup_iov(inf, &b->msg_pool);
-
-    u32 ctx = make_send_ctx(slot_idx, (u8)inf_idx, effective_qos);
-    submit_send_writev(b, c->fd, inf->iov, ctx);
-
-    log_debug("  -> fd=%d qos=%d pkt_id=%d (writev)", c->fd, effective_qos, packet_id);
-    return 0;
-}
-
-// Forward a publish to a single subscriber
-// Uses shared buffer for QoS 0, scatter-gather for QoS 1/2
-static i32 forward_publish_to_client(struct broker *b, u32 slot_idx, struct client_slot *c,
-                                     struct publish_ctx *pctx, u8 sub_qos) {
     // Downgrade QoS to minimum of publisher and subscriber
-    u8 effective_qos = (pctx->pub->qos < sub_qos) ? pctx->pub->qos : sub_qos;
+    u8 effective_qos = (msg->qos < sub_qos) ? msg->qos : sub_qos;
 
-    if (effective_qos == 0 && pctx->msg_idx != MSG_POOL_INVALID) {
-        // QoS 0: Use shared buffer (zero-copy send)
-        return forward_qos0_shared(b, c, pctx);
-    } else if (pctx->msg_idx != MSG_POOL_INVALID) {
-        // QoS 1/2: Use scatter-gather (writev with shared buffer + unique packet_id)
-        return forward_qos12_writev(b, slot_idx, c, pctx, effective_qos);
+    // Allocate send descriptor
+    u32 sd_idx = send_desc_pool_alloc(&b->send_desc_pool);
+    if (sd_idx == SEND_DESC_INVALID) {
+        b->msgs_dropped++;
+        b->drops_send_desc_empty++;
+        return -1;
     }
-    // No shared buffer available - drop message
-    b->msgs_dropped++;
-    b->drops_pool_empty++;
-    return -1;
+
+    struct send_desc *sd = send_desc_pool_get(&b->send_desc_pool, sd_idx);
+    sd->msg_idx          = pctx->msg_idx;
+    sd->slot_idx         = slot_idx;
+    sd->slot_gen         = sub->generation; // For stale detection
+    sd->sub_qos          = effective_qos;
+
+    // For QoS 1/2, allocate packet ID and track in inflight
+    if (effective_qos > 0) {
+        u16 packet_id = 0;
+        i32 inf_idx   = client_inflight_alloc(sub, effective_qos, pctx->msg_idx, &packet_id);
+        if (inf_idx < 0) {
+            send_desc_pool_free(&b->send_desc_pool, sd_idx);
+            b->msgs_dropped++;
+            b->drops_inflight_full++;
+            return -1;
+        }
+
+        sd->packet_id     = packet_id;
+        sd->pkt_id_be[0]  = (u8)(packet_id >> 8);
+        sd->pkt_id_be[1]  = (u8)(packet_id & 0xFF);
+
+        // Link send_desc to inflight entry
+        sub->inflight[inf_idx].send_desc_idx = sd_idx;
+    } else {
+        sd->packet_id = 0;
+    }
+
+    // Late materialization: build PUBLISH header now
+    materialize_publish_header(sd, msg->topic_len, msg->payload_len, effective_qos,
+                               msg->retain != 0, msg->dup != 0);
+
+    // Setup scatter-gather iovecs pointing into stolen buffer
+    const u8 *topic_ptr   = pctx->stolen_buf + msg->topic_off;
+    const u8 *payload_ptr = pctx->stolen_buf + msg->payload_off;
+    setup_send_iovec(sd, topic_ptr, msg->topic_len, payload_ptr, msg->payload_len);
+
+    // Increment refcount before submitting send
+    msg_pool_ref(&b->msg_pool, pctx->msg_idx);
+    pctx->subscriber_count++;
+
+    // Submit zero-copy send
+    sd->state = SEND_INFLIGHT;
+    submit_send_zc(b, sub->fd, sd_idx);
+
+    log_debug("  -> fd=%d qos=%d pkt_id=%d (zc)", sub->fd, effective_qos, sd->packet_id);
+    return 0;
 }
 
 // Callback for trie node match - send to matching slots
@@ -113,10 +173,11 @@ static void publish_node_cb(void *ctx, struct trie_node *node) {
                 continue;
             }
 
-            // Forward the publish
+            // Forward the publish using zero-copy
             // TODO: Get per-subscription QoS from trie node
-            u8 sub_qos = pctx->pub->qos; // For now, use publisher's QoS
-            forward_publish_to_client(b, slot_idx, c, pctx, sub_qos);
+            struct canonical_msg *msg = msg_pool_get(&b->msg_pool, pctx->msg_idx);
+            u8 sub_qos = msg ? msg->qos : 0; // For now, use publisher's QoS
+            forward_publish_zc(b, slot_idx, c, pctx, sub_qos);
 
             bits &= bits - 1; // Clear lowest bit
         }
@@ -152,11 +213,16 @@ INLINE i32 process_mqtt_packet(struct broker *b, struct client_slot *c, const u8
         struct mqtt_connect conn_pkt;
         i32 rc = mqtt_parse_connect(var_hdr, var_len, &conn_pkt);
         if (rc < 0) {
-            u8 reason =
+            // Send CONNACK with error
+            u8 slot = client_get_resp_slot(c);
+            c->resp_buf[slot][0] = 0; // session present = false
+            c->resp_buf[slot][1] =
                 (rc == MQTT_ERR_PROTOCOL) ? MQTT_CONNACK_PROTO_VERSION : MQTT_CONNACK_ID_REJECTED;
-            u8 *pbuf = client_get_proto_buf(c, b->proto_buf_count);
-            mqtt_encode_connack(pbuf, false, reason);
-            submit_send(b, c->fd, pbuf, MQTT_CONNACK_SIZE);
+            c->resp_iov[slot][0].iov_base = (void *)HDR_CONNACK;
+            c->resp_iov[slot][0].iov_len  = 2;
+            c->resp_iov[slot][1].iov_base = c->resp_buf[slot];
+            c->resp_iov[slot][1].iov_len  = 2;
+            submit_send_writev_simple(b, c->fd, c->resp_iov[slot], 2);
             return -1;
         }
 
@@ -168,9 +234,15 @@ INLINE i32 process_mqtt_packet(struct broker *b, struct client_slot *c, const u8
         log_debug("CONNECT fd=%d slot=%d client='%.*s' keepalive=%d", c->fd, slot_idx,
                   (i32)c->client_id_len, c->client_id, c->keepalive);
 
-        u8 *pbuf = client_get_proto_buf(c, b->proto_buf_count);
-        mqtt_encode_connack(pbuf, false, MQTT_CONNACK_ACCEPTED);
-        submit_send(b, c->fd, pbuf, MQTT_CONNACK_SIZE);
+        // Send CONNACK success
+        u8 slot2 = client_get_resp_slot(c);
+        c->resp_buf[slot2][0]          = 0; // session present = false
+        c->resp_buf[slot2][1]          = MQTT_CONNACK_ACCEPTED;
+        c->resp_iov[slot2][0].iov_base = (void *)HDR_CONNACK;
+        c->resp_iov[slot2][0].iov_len  = 2;
+        c->resp_iov[slot2][1].iov_base = c->resp_buf[slot2];
+        c->resp_iov[slot2][1].iov_len  = 2;
+        submit_send_writev_simple(b, c->fd, c->resp_iov[slot2], 2);
         break;
     }
 
@@ -179,10 +251,11 @@ INLINE i32 process_mqtt_packet(struct broker *b, struct client_slot *c, const u8
             return -1;
         }
         log_trace("PINGREQ fd=%d", c->fd);
-        u8 *pbuf = client_get_proto_buf(c, b->proto_buf_count);
-        pbuf[0]  = MQTT_PINGRESP << MQTT_TYPE_SHIFT;
-        pbuf[1]  = 0;
-        submit_send(b, c->fd, pbuf, 2);
+        // PINGRESP is just 2 bytes, no payload
+        u8 ping_slot = client_get_resp_slot(c);
+        c->resp_iov[ping_slot][0].iov_base = (void *)HDR_PINGRESP;
+        c->resp_iov[ping_slot][0].iov_len  = 2;
+        submit_send_writev_simple(b, c->fd, c->resp_iov[ping_slot], 1);
         break;
     }
 
@@ -199,7 +272,8 @@ INLINE i32 process_mqtt_packet(struct broker *b, struct client_slot *c, const u8
         struct inflight_msg *inf = client_inflight_find(c, packet_id);
         if (inf && inf->state == INFLIGHT_WAIT_PUBACK) {
             log_debug("PUBACK fd=%d packet_id=%d - delivery complete", c->fd, packet_id);
-            client_inflight_free(c, inf, &b->msg_pool);
+            // Note: msg_pool refcount is decremented during send completion
+            client_inflight_free(c, inf);
         } else {
             log_debug("PUBACK fd=%d packet_id=%d - unexpected", c->fd, packet_id);
         }
@@ -216,10 +290,9 @@ INLINE i32 process_mqtt_packet(struct broker *b, struct client_slot *c, const u8
             log_debug("PUBREC fd=%d packet_id=%d - sending PUBREL", c->fd, packet_id);
             inf->state = INFLIGHT_WAIT_PUBCOMP;
 
-            // Send PUBREL using proto_buf
-            u8 *pbuf = client_get_proto_buf(c, b->proto_buf_count);
-            mqtt_encode_pubrel(pbuf, packet_id);
-            submit_send(b, c->fd, pbuf, MQTT_PUBREL_SIZE);
+            // Send PUBREL using client scratch area
+            struct iovec *pubrel_iov = client_setup_resp_pkt(c, HDR_PUBREL, packet_id);
+            submit_send_writev_simple(b, c->fd, pubrel_iov, 2);
         } else {
             log_debug("PUBREC fd=%d packet_id=%d - unexpected", c->fd, packet_id);
         }
@@ -234,13 +307,13 @@ INLINE i32 process_mqtt_packet(struct broker *b, struct client_slot *c, const u8
         struct inflight_msg *inf = client_inflight_find(c, packet_id);
         if (inf && inf->state == INFLIGHT_WAIT_PUBREL && inf->direction == 1) {
             log_debug("PUBREL fd=%d packet_id=%d - sending PUBCOMP", c->fd, packet_id);
-            client_inflight_free(c, inf, &b->msg_pool);
+            client_inflight_free(c, inf);
         } else {
             log_debug("PUBREL fd=%d packet_id=%d - sending PUBCOMP (no state)", c->fd, packet_id);
         }
-        u8 *pbuf = client_get_proto_buf(c, b->proto_buf_count);
-        mqtt_encode_pubcomp(pbuf, packet_id);
-        submit_send(b, c->fd, pbuf, MQTT_PUBCOMP_SIZE);
+        // Send PUBCOMP using client scratch area
+        struct iovec *pubcomp_iov = client_setup_resp_pkt(c, HDR_PUBCOMP, packet_id);
+        submit_send_writev_simple(b, c->fd, pubcomp_iov, 2);
         break;
     }
 
@@ -252,7 +325,7 @@ INLINE i32 process_mqtt_packet(struct broker *b, struct client_slot *c, const u8
         struct inflight_msg *inf = client_inflight_find(c, packet_id);
         if (inf && inf->state == INFLIGHT_WAIT_PUBCOMP) {
             log_debug("PUBCOMP fd=%d packet_id=%d - delivery complete", c->fd, packet_id);
-            client_inflight_free(c, inf, &b->msg_pool);
+            client_inflight_free(c, inf);
         } else {
             log_debug("PUBCOMP fd=%d packet_id=%d - unexpected", c->fd, packet_id);
         }
@@ -287,10 +360,13 @@ INLINE i32 process_mqtt_packet(struct broker *b, struct client_slot *c, const u8
                       sub_pkt.filters[i].qos, return_codes[i]);
         }
 
-        u8 *pbuf = client_get_proto_buf(c, b->proto_buf_count);
+        // Encode SUBACK into resp_buf: [0x90, remaining_len, pkt_id_hi, pkt_id_lo, return_codes...]
+        u8 suback_slot = client_get_resp_slot(c);
         u32 suback_len =
-            mqtt_encode_suback(pbuf, sub_pkt.packet_id, return_codes, sub_pkt.filter_count);
-        submit_send(b, c->fd, pbuf, suback_len);
+            mqtt_encode_suback(c->resp_buf[suback_slot], sub_pkt.packet_id, return_codes, sub_pkt.filter_count);
+        c->resp_iov[suback_slot][0].iov_base = c->resp_buf[suback_slot];
+        c->resp_iov[suback_slot][0].iov_len  = suback_len;
+        submit_send_writev_simple(b, c->fd, c->resp_iov[suback_slot], 1);
         break;
     }
 
@@ -312,9 +388,9 @@ INLINE i32 process_mqtt_packet(struct broker *b, struct client_slot *c, const u8
                       (i32)unsub_pkt.filters[i].len, (const char *)unsub_pkt.filters[i].ptr);
         }
 
-        u8 *pbuf = client_get_proto_buf(c, b->proto_buf_count);
-        mqtt_encode_unsuback(pbuf, unsub_pkt.packet_id);
-        submit_send(b, c->fd, pbuf, MQTT_UNSUBACK_SIZE);
+        // Send UNSUBACK using writev
+        struct iovec *unsuback_iov = client_setup_resp_pkt(c, HDR_UNSUBACK, unsub_pkt.packet_id);
+        submit_send_writev_simple(b, c->fd, unsuback_iov, 2);
         break;
     }
 
@@ -332,19 +408,20 @@ INLINE i32 process_mqtt_packet(struct broker *b, struct client_slot *c, const u8
         log_debug("PUBLISH topic='%.*s' qos=%d", (i32)pub_pkt.topic.len,
                   (const char *)pub_pkt.topic.ptr, pub_pkt.qos);
 
+        // Handle publisher QoS acknowledgments BEFORE fan-out
         if (pub_pkt.qos == 1) {
-            u8 *pbuf = client_get_proto_buf(c, b->proto_buf_count);
-            mqtt_encode_puback(pbuf, pub_pkt.packet_id);
-            submit_send(b, c->fd, pbuf, MQTT_PUBACK_SIZE);
+            // Send PUBACK to publisher
+            struct iovec *puback_iov = client_setup_resp_pkt(c, HDR_PUBACK, pub_pkt.packet_id);
+            submit_send_writev_simple(b, c->fd, puback_iov, 2);
         } else if (pub_pkt.qos == 2) {
             struct inflight_msg *existing = client_inflight_find(c, pub_pkt.packet_id);
             if (existing && existing->direction == 1) {
                 log_debug("PUBLISH fd=%d qos=2 pkt_id=%d DUP - resending PUBREC", c->fd,
                           pub_pkt.packet_id);
-                u8 *pbuf = client_get_proto_buf(c, b->proto_buf_count);
-                mqtt_encode_pubrec(pbuf, pub_pkt.packet_id);
-                submit_send(b, c->fd, pbuf, MQTT_PUBREC_SIZE);
-                break;
+                // Resend PUBREC
+                struct iovec *pubrec_dup_iov = client_setup_resp_pkt(c, HDR_PUBREC, pub_pkt.packet_id);
+                submit_send_writev_simple(b, c->fd, pubrec_dup_iov, 2);
+                break; // Don't re-fan-out duplicate
             }
 
             i32 inf_idx = client_inflight_track_incoming(c, pub_pkt.packet_id);
@@ -353,51 +430,87 @@ INLINE i32 process_mqtt_packet(struct broker *b, struct client_slot *c, const u8
                 return -1;
             }
 
-            u8 *pbuf = client_get_proto_buf(c, b->proto_buf_count);
-            mqtt_encode_pubrec(pbuf, pub_pkt.packet_id);
-            submit_send(b, c->fd, pbuf, MQTT_PUBREC_SIZE);
+            // Send PUBREC
+            struct iovec *pubrec_iov = client_setup_resp_pkt(c, HDR_PUBREC, pub_pkt.packet_id);
+            submit_send_writev_simple(b, c->fd, pubrec_iov, 2);
         }
 
+        // === Zero-Copy Fan-Out ===
+
+        // Backpressure: if send_desc pool is <10% free, drop message
+        // This prevents cascading failure when sends back up
+        u32 sd_free = b->send_desc_pool.free_count;
+        u32 sd_threshold = b->send_desc_pool.capacity / 10; // 10%
+        if (sd_free < sd_threshold) {
+            b->msgs_dropped++;
+            b->drops_send_desc_empty++;
+            break; // Drop silently - backpressure
+        }
+
+        // Allocate canonical message metadata
+        u32 msg_idx = msg_pool_alloc(&b->msg_pool);
+        if (msg_idx == MSG_POOL_INVALID) {
+            b->msgs_dropped++;
+            b->drops_msg_pool_empty++;
+            log_warn("PUBLISH dropped - msg_pool exhausted");
+            break; // Don't fail connection, just drop message
+        }
+
+        // Steal the publisher's recv buffer (pass total_len so remaining data is preserved)
+        u32 stolen_buf_idx;
+        u32 new_buf_idx = steal_recv_buffer(b, c, total_len, &stolen_buf_idx);
+        if (new_buf_idx == BUF_POOL_INVALID) {
+            // Can't steal - no free buffers. Free msg and drop.
+            msg_pool_free(&b->msg_pool, msg_idx);
+            b->msgs_dropped++;
+            b->drops_msg_pool_empty++;
+            log_warn("PUBLISH dropped - no buffers for steal");
+            break;
+        }
+
+        // Get pointer to stolen buffer
+        u8 *stolen_buf = buf_pool_get(&b->recv_pool, stolen_buf_idx);
+
+        // Setup canonical message metadata (zero-copy - offsets into stolen buffer)
+        struct canonical_msg *msg = msg_pool_get(&b->msg_pool, msg_idx);
+        msg->buf_idx              = stolen_buf_idx;
+        // Calculate offsets: topic.ptr and payload are pointers into original buffer
+        // We need to convert them to offsets from buffer start
+        u8 *recv_buf       = stolen_buf; // This is the original buffer
+        msg->topic_off     = (u16)(pub_pkt.topic.ptr - recv_buf);
+        msg->topic_len     = pub_pkt.topic.len;
+        msg->payload_off   = (u32)(pub_pkt.payload - recv_buf);
+        msg->payload_len   = pub_pkt.payload_len;
+        msg->qos           = pub_pkt.qos;
+        msg->retain        = pub_pkt.retain ? 1 : 0;
+        msg->dup           = pub_pkt.dup ? 1 : 0;
+
+        // Take base reference BEFORE fan-out to prevent premature freeing.
+        // This ensures the buffer survives even if submit_send_zc fails mid-iteration.
+        // Without this, if submit fails and decrements refcount to 0, subsequent
+        // subscribers in the same fan-out would access freed memory.
+        msg_pool_ref(&b->msg_pool, msg_idx);
+
+        // Setup publish context
         struct publish_ctx pctx;
-        pctx.broker   = b;
-        pctx.pub      = &pub_pkt;
-        pctx.msg_idx  = MSG_POOL_INVALID;
-        pctx.msg_len  = 0;
-        pctx.msg_data = NULL;
+        pctx.broker           = b;
+        pctx.msg_idx          = msg_idx;
+        pctx.stolen_buf_idx   = stolen_buf_idx;
+        pctx.stolen_buf       = stolen_buf;
+        pctx.subscriber_count = 0;
         memset(pctx.sent_bitmap, 0, sizeof(pctx.sent_bitmap));
 
-        // Allocate shared buffer and encode for fan-out
-        pctx.msg_idx = msg_pool_alloc(&b->msg_pool);
-        if (pctx.msg_idx != MSG_POOL_INVALID) {
-            pctx.msg_data              = msg_pool_data(&b->msg_pool, pctx.msg_idx);
-            struct msg_header *msg_hdr = msg_pool_header(&b->msg_pool, pctx.msg_idx);
-
-            if (pub_pkt.qos == 0) {
-                // QoS 0: Encode complete packet (no packet_id)
-                pctx.msg_len       = mqtt_encode_publish(pctx.msg_data, &pub_pkt, 0);
-                msg_hdr->total_len = (u16)pctx.msg_len;
-            } else {
-                // QoS 1/2: Encode in scatter-gather format (without packet_id)
-                u32 scatter_len = 0;
-                u32 payload_len = 0;
-                u32 topic_end   = mqtt_encode_publish_scatter(pctx.msg_data, &pub_pkt, &scatter_len,
-                                                              &payload_len);
-                msg_hdr->topic_end   = (u16)topic_end;
-                msg_hdr->total_len   = (u16)scatter_len;
-                msg_hdr->payload_len = payload_len;
-                pctx.msg_len         = scatter_len;
-            }
-        }
-
+        // Fan-out to matching subscribers
         trie_match(&b->trie, pub_pkt.topic.ptr, pub_pkt.topic.len, publish_node_cb, &pctx);
 
-        // If no subscribers used the shared buffer, free it now
-        if (pctx.msg_idx != MSG_POOL_INVALID) {
-            struct msg_header *msg_hdr = msg_pool_header(&b->msg_pool, pctx.msg_idx);
-            if (msg_hdr->ref_count == 0) {
-                msg_pool_free(&b->msg_pool, pctx.msg_idx);
-            }
+        // Release base reference. If this brings refcount to 0, all sends either
+        // failed or there were no subscribers - free the stolen buffer and message.
+        u32 final_ref = msg_pool_unref(&b->msg_pool, msg_idx);
+        if (final_ref == 0) {
+            buf_pool_free(&b->recv_pool, stolen_buf_idx);
+            msg_pool_free(&b->msg_pool, msg_idx);
         }
+        // Otherwise, buffer is freed when last send completes (refcount -> 0)
 
         b->msgs_published++;
         break;

@@ -39,19 +39,11 @@
 // Memory per client = MAX_INFLIGHT * SEND_BUF_SIZE
 // With 4096 clients: 4096 * 16 * 4KB = 256MB total
 #ifndef LLMQ_MAX_INFLIGHT
-#define LLMQ_MAX_INFLIGHT 128 // Max capacity for inflight array (runtime can use less)
+#define LLMQ_MAX_INFLIGHT 256 // Max capacity for inflight array (runtime can use less)
 #endif
 
 #ifndef LLMQ_SEND_BUF_SIZE
 #define LLMQ_SEND_BUF_SIZE 4096 // 4KB per-inflight send buffer
-#endif
-
-#ifndef LLMQ_PROTO_BUF_SIZE
-#define LLMQ_PROTO_BUF_SIZE 64 // Protocol response buffer (CONNACK, PUBACK, etc.)
-#endif
-
-#ifndef LLMQ_PROTO_BUF_COUNT
-#define LLMQ_PROTO_BUF_COUNT 32 // Max capacity for proto_buf array (runtime can use less)
 #endif
 
 #ifndef LLMQ_PENDING_MSG_DATA

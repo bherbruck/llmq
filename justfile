@@ -32,7 +32,7 @@ build: _bindir
 
 # Build debug binary
 debug: _bindir
-    {{cc}} {{cflags}} {{clang_flags}} -g -O1 -DDEBUG -o {{out}} {{sources}}
+    {{cc}} {{cflags}} {{clang_flags}} -g -O1 -fno-omit-frame-pointer -DDEBUG -o {{out}} {{sources}}
     @echo "Built: {{out}} (debug)"
 
 # Build with sanitizers (requires libc, for testing only)
@@ -100,6 +100,25 @@ run: debug
 # Run with strace to see syscalls
 strace: debug
     strace -f -e trace=io_uring_setup,io_uring_enter,io_uring_register {{out}}
+
+# Profile running broker with perf (attach to existing process)
+# Usage: start broker, connect clients, then run `just perf 30` to record for 30s
+perf seconds="30":
+    #!/usr/bin/env bash
+    BROKER_PID=$(pidof broker)
+    if [ -z "$BROKER_PID" ]; then
+        echo "No broker running. Start it first with: just run"
+        exit 1
+    fi
+    echo "Attaching to broker PID $BROKER_PID for {{seconds}}s..."
+    perf record -F 9999 -g -p $BROKER_PID -o {{bindir}}/perf.data -- sleep {{seconds}}
+    echo ""
+    echo "=== Top Functions ==="
+    perf report -i {{bindir}}/perf.data --stdio --no-children -n --percent-limit 1 | head -60
+
+# View perf results interactively
+perf-report:
+    perf report -i {{bindir}}/perf.data
 
 # === Utilities ===
 

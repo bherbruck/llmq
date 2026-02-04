@@ -14,13 +14,18 @@
 #define SYS_write             1
 #define SYS_open              2
 #define SYS_close             3
+#define SYS_writev            20
 #define SYS_mmap              9
 #define SYS_munmap            11
 #define SYS_socket            41
+#define SYS_sendmsg           46
 #define SYS_accept            43
 #define SYS_bind              49
 #define SYS_listen            50
 #define SYS_setsockopt        54
+
+// sendmsg flags
+#define MSG_DONTWAIT 0x40
 #define SYS_exit              60
 #define SYS_fcntl             72
 #define SYS_rt_sigaction      13
@@ -138,6 +143,25 @@ INLINE i64 sys_read(i32 fd, void *buf, usize count) {
 
 INLINE i64 sys_write(i32 fd, const void *buf, usize count) {
     return syscall3(SYS_write, fd, (i64)buf, (i64)count);
+}
+
+INLINE i64 sys_writev(i32 fd, const struct iovec *iov, i32 iovcnt) {
+    return syscall3(SYS_writev, fd, (i64)iov, iovcnt);
+}
+
+// msghdr for sendmsg
+struct msghdr {
+    void *msg_name;
+    u32 msg_namelen;
+    struct iovec *msg_iov;
+    usize msg_iovlen;
+    void *msg_control;
+    usize msg_controllen;
+    i32 msg_flags;
+};
+
+INLINE i64 sys_sendmsg(i32 fd, const struct msghdr *msg, i32 flags) {
+    return syscall3(SYS_sendmsg, fd, (i64)msg, flags);
 }
 
 INLINE i32 sys_close(i32 fd) {
