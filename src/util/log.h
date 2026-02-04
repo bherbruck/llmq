@@ -196,6 +196,12 @@ INLINE void log_writef(enum log_level level, const char *fmt, va_list ap) {
 // Public API
 // =============================================================================
 
+// In release builds (NDEBUG), trace/debug logging compiles to nothing
+// No function call overhead, no argument evaluation
+#ifdef NDEBUG
+#define log_trace(...) ((void)0)
+#define log_debug(...) ((void)0)
+#else
 INLINE void log_trace(const char *fmt, ...) {
     if (g_log_level > LOG_TRACE)
         return;
@@ -213,6 +219,7 @@ INLINE void log_debug(const char *fmt, ...) {
     log_writef(LOG_DEBUG, fmt, ap);
     va_end(ap);
 }
+#endif
 
 INLINE void log_info(const char *fmt, ...) {
     if (g_log_level > LOG_INFO)

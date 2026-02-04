@@ -349,10 +349,8 @@ INLINE void handle_recv(struct broker *b, struct io_uring_cqe *cqe) {
 }
 
 INLINE void handle_send(struct broker *b, struct io_uring_cqe *cqe) {
-    i32 fd = (i32)ud_fd(cqe->user_data);
-
     if (cqe->res < 0) {
-        log_debug("send error fd=%d err=%d", fd, cqe->res);
+        log_debug("send error fd=%d err=%d", (i32)ud_fd(cqe->user_data), cqe->res);
         // Don't close on send error - recv will detect the broken connection.
         // Closing here risks closing a reused fd: if the old connection's close
         // completed and fd was reused for a new client, we'd close the new client.
@@ -365,7 +363,6 @@ INLINE void handle_send(struct broker *b, struct io_uring_cqe *cqe) {
 // Cleanup: free send_desc, decrement msg refcount, free stolen buffer if last ref
 INLINE void handle_send_zc(struct broker *b, struct io_uring_cqe *cqe) {
     u32 send_desc_idx = ud_ctx(cqe->user_data);
-    i32 fd            = (i32)ud_fd(cqe->user_data);
 
     struct send_desc *sd = send_desc_pool_get(&b->send_desc_pool, send_desc_idx);
     if (unlikely(!sd)) {
@@ -374,7 +371,7 @@ INLINE void handle_send_zc(struct broker *b, struct io_uring_cqe *cqe) {
     }
 
     if (unlikely(cqe->res < 0)) {
-        log_debug("zc send error fd=%d err=%d", fd, cqe->res);
+        log_debug("zc send error fd=%d err=%d", (i32)ud_fd(cqe->user_data), cqe->res);
         b->msgs_dropped++;
         b->drops_send_failed++;
         // Don't close on send error - recv will detect the broken connection.
