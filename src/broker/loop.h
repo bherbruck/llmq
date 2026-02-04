@@ -174,6 +174,37 @@ INLINE bool send_buf(struct broker *b, struct client_slot *c, const void *buf, u
     return rc == (i64)len;
 }
 
+// =============================================================================
+// Async Protocol Responses (for high-volume QoS flows)
+// =============================================================================
+
+// Submit async send for protocol response from inflight entry
+// The response is pre-built in inf->resp_pkt, which lives until ceremony completes
+// Returns true if queued, false if SQ full
+INLINE bool submit_send_inf(struct broker *b, struct client_slot *c,
+                            struct inflight_msg *inf, const u8 *hdr) {
+    if (c->state != CLIENT_ACTIVE) {
+        return false;
+    }
+
+    struct io_uring_sqe *sqe = get_sqe_with_flush(b);
+    if (!sqe) {
+        return false;
+    }
+
+    // Build response packet in inflight buffer (lives until ceremony completes)
+    inf->resp_pkt[0] = hdr[0];
+    inf->resp_pkt[1] = hdr[1];
+    inf->resp_pkt[2] = inf->packet_id_be[0];
+    inf->resp_pkt[3] = inf->packet_id_be[1];
+
+    u32 slot_idx = (u32)(c - b->clients);
+    ring_prep_send(sqe, c->fd, inf->resp_pkt, 4, 0);
+    sqe->user_data = make_user_data(OP_SEND_INF, (u32)c->fd, slot_idx);
+    ring_submit_sqe(&b->ring);
+    return true;
+}
+
 // Submit close and mark client as CLOSING to prevent new operations on this fd.
 // This prevents the fd-reuse race where a recv CQE arrives after fd is closed
 // and reused for a new connection.
@@ -482,6 +513,12 @@ INLINE void dispatch_cqe(struct broker *b, struct io_uring_cqe *cqe) {
         break;
     case OP_CLOSE:
         handle_close(b, cqe);
+        break;
+    case OP_SEND_INF:
+        // Protocol response from inflight buffer - just count bytes
+        if (cqe->res > 0) {
+            b->bytes_sent += (u64)cqe->res;
+        }
         break;
     default:
         log_warn("Unknown op: %d", op);

@@ -47,13 +47,14 @@ struct inflight_msg {
     u64 deadline;        // Monotonic timestamp for timeout (0 = no timeout)
     u16 packet_id;       // MQTT packet identifier (native endian for lookups)
     u8 packet_id_be[2];  // Big-endian packet ID for protocol responses
+    u8 resp_pkt[4];      // Pre-built protocol response (type+len+packet_id) for async send
     u8 state;            // enum inflight_state
     u8 qos;              // Original QoS level
     u8 dup_count;        // Retransmission count
     u8 direction;        // 0 = outgoing (we sent), 1 = incoming (we received)
 };
 
-STATIC_ASSERT(sizeof(struct inflight_msg) == 24, "inflight_msg should be 24 bytes");
+STATIC_ASSERT(sizeof(struct inflight_msg) == 32, "inflight_msg should be 32 bytes");
 
 // =============================================================================
 // Pending Message (for offline QoS 1/2 delivery)
@@ -467,18 +468,26 @@ INLINE i32 client_inflight_track_incoming(struct client_slot *c, u16 packet_id, 
     return (i32)slot;
 }
 
-// Find inflight entry by packet ID - O(1) via hash table
+// Find inflight entry by packet ID - O(1) direct indexing for outgoing messages
+// Outgoing packet_ids are assigned so (packet_id - 1) & mask == slot
+// Falls back to hash table for incoming messages with arbitrary packet_ids
 INLINE struct inflight_msg *client_inflight_find(struct client_slot *c, u16 packet_id) {
     if (unlikely(packet_id == 0)) return NULL;
 
-    // Hash table lookup - O(1) average
+    // Fast path: direct index for outgoing messages (most common case)
+    u16 slot = (packet_id - 1) & c->inflight_mask;
+    if (likely(c->inflight[slot].state != INFLIGHT_FREE &&
+               c->inflight[slot].packet_id == packet_id)) {
+        return &c->inflight[slot];
+    }
+
+    // Slow path: hash table for incoming messages with arbitrary packet_ids
     u32 idx = packet_id & INFLIGHT_HASH_MASK;
     for (u32 probe = 0; probe < INFLIGHT_HASH_SIZE; probe++) {
-        u16 slot = c->inflight_pkt_hash[idx];
+        slot = c->inflight_pkt_hash[idx];
         if (slot == INFLIGHT_HASH_EMPTY) {
-            return NULL; // Not found
+            return NULL;
         }
-        // Verify packet_id match (handle hash collisions)
         if (slot < c->max_inflight &&
             c->inflight[slot].state != INFLIGHT_FREE &&
             c->inflight[slot].packet_id == packet_id) {

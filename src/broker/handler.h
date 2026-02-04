@@ -20,6 +20,8 @@ INLINE void submit_send_zc(struct broker *b, i32 fd, u32 send_desc_idx);
 INLINE bool send_static(struct broker *b, struct client_slot *c, const void *buf, u32 len);
 INLINE bool send_resp(struct broker *b, struct client_slot *c, const u8 *hdr, u16 packet_id);
 INLINE bool send_buf(struct broker *b, struct client_slot *c, const void *buf, u32 len);
+INLINE bool submit_send_inf(struct broker *b, struct client_slot *c,
+                            struct inflight_msg *inf, const u8 *hdr);
 INLINE void release_msg_ref(struct broker *b, u32 msg_idx);
 
 // Static headers for zero-copy protocol responses (type<<4 | flags, remaining_len)

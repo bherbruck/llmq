@@ -173,8 +173,8 @@ INLINE void fsm_sub_pubrec_received(struct broker *b, struct client_slot *sub,
     inf->state    = INFLIGHT_WAIT_PUBCOMP;
     inf->deadline = b->now + LLMQ_INFLIGHT_TIMEOUT_MS;
 
-    // Send PUBREL
-    send_pubrel(b, sub, packet_id);
+    // Send PUBREL async (hot path - 1000s of these per message)
+    submit_send_inf(b, sub, inf, HDR_PUBREL);
 }
 
 // Called when we receive PUBCOMP from subscriber (QoS 2 complete).

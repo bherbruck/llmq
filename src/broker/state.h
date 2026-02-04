@@ -432,11 +432,12 @@ INLINE void broker_slot_resume(struct broker *b, u32 slot_idx, i32 fd) {
 // =============================================================================
 
 enum op_type {
-    OP_ACCEPT  = 1,
-    OP_RECV    = 2,
-    OP_SEND    = 3,
-    OP_CLOSE   = 4,
-    OP_SEND_ZC = 5, // Zero-copy send: context = send_desc index
+    OP_ACCEPT   = 1,
+    OP_RECV     = 2,
+    OP_SEND     = 3,
+    OP_CLOSE    = 4,
+    OP_SEND_ZC  = 5, // Zero-copy send: context = send_desc index
+    OP_SEND_INF = 6, // Send from inflight entry: context = slot_idx, buffer is inflight.resp_pkt
 };
 
 // Pack: [8-bit op][24-bit fd][32-bit context]
