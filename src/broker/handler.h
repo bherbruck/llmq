@@ -30,6 +30,34 @@ static const u8 HDR_UNSUBACK[2] = {0xB0, 0x02};
 static const u8 HDR_PINGRESP[2] = {0xD0, 0x00};
 
 // =============================================================================
+// Protocol Response Senders (used by FSM)
+// =============================================================================
+
+INLINE void send_puback(struct broker *b, struct client_slot *c, u16 packet_id) {
+    struct iovec *iov = client_setup_resp_pkt(c, HDR_PUBACK, packet_id);
+    submit_send_writev_simple(b, c->fd, iov, 2);
+}
+
+INLINE void send_pubrec(struct broker *b, struct client_slot *c, u16 packet_id) {
+    struct iovec *iov = client_setup_resp_pkt(c, HDR_PUBREC, packet_id);
+    submit_send_writev_simple(b, c->fd, iov, 2);
+}
+
+INLINE void send_pubrel(struct broker *b, struct client_slot *c, u16 packet_id) {
+    struct iovec *iov = client_setup_resp_pkt(c, HDR_PUBREL, packet_id);
+    submit_send_writev_simple(b, c->fd, iov, 2);
+}
+
+INLINE void send_pubcomp(struct broker *b, struct client_slot *c, u16 packet_id) {
+    struct iovec *iov = client_setup_resp_pkt(c, HDR_PUBCOMP, packet_id);
+    submit_send_writev_simple(b, c->fd, iov, 2);
+}
+
+// Include FSM after protocol senders are defined
+#include "broker/msg_path.h"
+#include "broker/mqtt_fsm.h"
+
+// =============================================================================
 // Zero-Copy Publish Context
 // =============================================================================
 
@@ -82,69 +110,20 @@ INLINE u32 steal_recv_buffer(struct broker *b, struct client_slot *pub, u32 pack
 // Late Materialization - Build PUBLISH at Send Time
 // =============================================================================
 
-// Forward publish to a single subscriber using zero-copy
-// Materializes PUBLISH header on-the-fly, uses scatter-gather for topic/payload
+// Forward publish to a single subscriber using zero-copy via FSM
 // msg is pre-fetched by caller to avoid repeated lookups in fan-out loop
 static i32 forward_publish_zc(struct broker *b, u32 slot_idx, struct client_slot *sub,
                                struct publish_ctx *pctx, struct canonical_msg *msg, u8 sub_qos) {
     // Downgrade QoS to minimum of publisher and subscriber
     u8 effective_qos = (msg->qos < sub_qos) ? msg->qos : sub_qos;
 
-    // Allocate send descriptor
-    u32 sd_idx = send_desc_pool_alloc(&b->send_desc_pool);
-    if (unlikely(sd_idx == SEND_DESC_INVALID)) {
-        b->msgs_dropped++;
-        b->drops_send_desc_empty++;
-        return -1;
+    // Delegate to FSM - it handles refcount, inflight, send_desc, and submission
+    i32 rc = fsm_sub_start_delivery(b, sub, pctx->msg_idx, effective_qos, slot_idx);
+    if (rc == 0) {
+        pctx->subscriber_count++;
+        log_debug("  -> fd=%d qos=%d (zc)", sub->fd, effective_qos);
     }
-
-    struct send_desc *sd = send_desc_pool_get(&b->send_desc_pool, sd_idx);
-    sd->msg_idx          = pctx->msg_idx;
-    sd->slot_idx         = slot_idx;
-    sd->slot_gen         = sub->generation; // For stale detection
-    sd->sub_qos          = effective_qos;
-
-    // For QoS 1/2, allocate packet ID and track in inflight
-    if (effective_qos > 0) {
-        u16 packet_id = 0;
-        u64 deadline  = b->now + LLMQ_INFLIGHT_TIMEOUT_MS;
-        i32 inf_idx   = client_inflight_alloc(sub, effective_qos, pctx->msg_idx, deadline, &packet_id);
-        if (unlikely(inf_idx < 0)) {
-            send_desc_pool_free(&b->send_desc_pool, sd_idx);
-            b->msgs_dropped++;
-            b->drops_inflight_full++;
-            return -1;
-        }
-
-        sd->packet_id     = packet_id;
-        sd->pkt_id_be[0]  = (u8)(packet_id >> 8);
-        sd->pkt_id_be[1]  = (u8)(packet_id & 0xFF);
-
-        // Link send_desc to inflight entry
-        sub->inflight[inf_idx].send_desc_idx = sd_idx;
-    } else {
-        sd->packet_id = 0;
-    }
-
-    // Late materialization: build PUBLISH header now
-    materialize_publish_header(sd, msg->topic_len, msg->payload_len, effective_qos,
-                               msg->retain != 0, msg->dup != 0);
-
-    // Setup scatter-gather iovecs pointing into stolen buffer
-    const u8 *topic_ptr   = pctx->stolen_buf + msg->topic_off;
-    const u8 *payload_ptr = pctx->stolen_buf + msg->payload_off;
-    setup_send_iovec(sd, topic_ptr, msg->topic_len, payload_ptr, msg->payload_len);
-
-    // Increment refcount before submitting send
-    msg_pool_ref(&b->msg_pool, pctx->msg_idx);
-    pctx->subscriber_count++;
-
-    // Submit zero-copy send
-    sd->state = SEND_INFLIGHT;
-    submit_send_zc(b, sub->fd, sd_idx);
-
-    log_debug("  -> fd=%d qos=%d pkt_id=%d (zc)", sub->fd, effective_qos, sd->packet_id);
-    return 0;
+    return rc;
 }
 
 // Callback for trie node match - send to matching slots
@@ -271,16 +250,9 @@ INLINE i32 process_mqtt_packet(struct broker *b, struct client_slot *c, const u8
         if (var_len < 2) {
             return -1;
         }
-        u16 packet_id            = mqtt_read_u16(var_hdr);
-        struct inflight_msg *inf = client_inflight_find(c, packet_id);
-        if (inf && inf->state == INFLIGHT_WAIT_PUBACK) {
-            log_debug("PUBACK fd=%d packet_id=%d - delivery complete", c->fd, packet_id);
-            // QoS 1 ceremony complete - release message reference
-            release_msg_ref(b, inf->msg_idx);
-            client_inflight_free(c, inf);
-        } else {
-            log_debug("PUBACK fd=%d packet_id=%d - unexpected", c->fd, packet_id);
-        }
+        u16 packet_id = mqtt_read_u16(var_hdr);
+        log_debug("PUBACK fd=%d packet_id=%d", c->fd, packet_id);
+        fsm_sub_puback_received(b, c, packet_id);
         break;
     }
 
@@ -288,18 +260,9 @@ INLINE i32 process_mqtt_packet(struct broker *b, struct client_slot *c, const u8
         if (var_len < 2) {
             return -1;
         }
-        u16 packet_id            = mqtt_read_u16(var_hdr);
-        struct inflight_msg *inf = client_inflight_find(c, packet_id);
-        if (inf && inf->state == INFLIGHT_WAIT_PUBREC) {
-            log_debug("PUBREC fd=%d packet_id=%d - sending PUBREL", c->fd, packet_id);
-            inf->state = INFLIGHT_WAIT_PUBCOMP;
-
-            // Send PUBREL using client scratch area
-            struct iovec *pubrel_iov = client_setup_resp_pkt(c, HDR_PUBREL, packet_id);
-            submit_send_writev_simple(b, c->fd, pubrel_iov, 2);
-        } else {
-            log_debug("PUBREC fd=%d packet_id=%d - unexpected", c->fd, packet_id);
-        }
+        u16 packet_id = mqtt_read_u16(var_hdr);
+        log_debug("PUBREC fd=%d packet_id=%d", c->fd, packet_id);
+        fsm_sub_pubrec_received(b, c, packet_id);
         break;
     }
 
@@ -307,17 +270,9 @@ INLINE i32 process_mqtt_packet(struct broker *b, struct client_slot *c, const u8
         if (var_len < 2) {
             return -1;
         }
-        u16 packet_id            = mqtt_read_u16(var_hdr);
-        struct inflight_msg *inf = client_inflight_find(c, packet_id);
-        if (inf && inf->state == INFLIGHT_WAIT_PUBREL && inf->direction == 1) {
-            log_debug("PUBREL fd=%d packet_id=%d - sending PUBCOMP", c->fd, packet_id);
-            client_inflight_free(c, inf);
-        } else {
-            log_debug("PUBREL fd=%d packet_id=%d - sending PUBCOMP (no state)", c->fd, packet_id);
-        }
-        // Send PUBCOMP using client scratch area
-        struct iovec *pubcomp_iov = client_setup_resp_pkt(c, HDR_PUBCOMP, packet_id);
-        submit_send_writev_simple(b, c->fd, pubcomp_iov, 2);
+        u16 packet_id = mqtt_read_u16(var_hdr);
+        log_debug("PUBREL fd=%d packet_id=%d", c->fd, packet_id);
+        fsm_pub_pubrel_received(b, c, packet_id);
         break;
     }
 
@@ -325,16 +280,9 @@ INLINE i32 process_mqtt_packet(struct broker *b, struct client_slot *c, const u8
         if (var_len < 2) {
             return -1;
         }
-        u16 packet_id            = mqtt_read_u16(var_hdr);
-        struct inflight_msg *inf = client_inflight_find(c, packet_id);
-        if (inf && inf->state == INFLIGHT_WAIT_PUBCOMP) {
-            log_debug("PUBCOMP fd=%d packet_id=%d - delivery complete", c->fd, packet_id);
-            // QoS 2 ceremony complete - release message reference
-            release_msg_ref(b, inf->msg_idx);
-            client_inflight_free(c, inf);
-        } else {
-            log_debug("PUBCOMP fd=%d packet_id=%d - unexpected", c->fd, packet_id);
-        }
+        u16 packet_id = mqtt_read_u16(var_hdr);
+        log_debug("PUBCOMP fd=%d packet_id=%d", c->fd, packet_id);
+        fsm_sub_pubcomp_received(b, c, packet_id);
         break;
     }
 
@@ -414,32 +362,10 @@ INLINE i32 process_mqtt_packet(struct broker *b, struct client_slot *c, const u8
         log_debug("PUBLISH topic='%.*s' qos=%d", (i32)pub_pkt.topic.len,
                   (const char *)pub_pkt.topic.ptr, pub_pkt.qos);
 
-        // Handle publisher QoS acknowledgments BEFORE fan-out
-        if (pub_pkt.qos == 1) {
-            // Send PUBACK to publisher
-            struct iovec *puback_iov = client_setup_resp_pkt(c, HDR_PUBACK, pub_pkt.packet_id);
-            submit_send_writev_simple(b, c->fd, puback_iov, 2);
-        } else if (pub_pkt.qos == 2) {
-            struct inflight_msg *existing = client_inflight_find(c, pub_pkt.packet_id);
-            if (existing && existing->direction == 1) {
-                log_debug("PUBLISH fd=%d qos=2 pkt_id=%d DUP - resending PUBREC", c->fd,
-                          pub_pkt.packet_id);
-                // Resend PUBREC
-                struct iovec *pubrec_dup_iov = client_setup_resp_pkt(c, HDR_PUBREC, pub_pkt.packet_id);
-                submit_send_writev_simple(b, c->fd, pubrec_dup_iov, 2);
-                break; // Don't re-fan-out duplicate
-            }
-
-            u64 deadline = b->now + LLMQ_INFLIGHT_TIMEOUT_MS;
-            i32 inf_idx = client_inflight_track_incoming(c, pub_pkt.packet_id, deadline);
-            if (inf_idx < 0) {
-                log_debug("PUBLISH fd=%d qos=2 - inflight full, dropping", c->fd);
-                return -1;
-            }
-
-            // Send PUBREC
-            struct iovec *pubrec_iov = client_setup_resp_pkt(c, HDR_PUBREC, pub_pkt.packet_id);
-            submit_send_writev_simple(b, c->fd, pubrec_iov, 2);
+        // Publisher ceremony - handles PUBACK/PUBREC and duplicate detection
+        // Returns false for QoS 2 duplicates (don't fan-out again)
+        if (!fsm_pub_received(b, c, pub_pkt.qos, pub_pkt.packet_id)) {
+            break; // Duplicate QoS 2 or error - don't fan-out
         }
 
         // === Zero-Copy Fan-Out ===

@@ -193,30 +193,8 @@ INLINE void release_msg_ref(struct broker *b, u32 msg_idx) {
     }
 }
 
-// Release all message refs for pending inflight entries on disconnect
-// Must be called BEFORE client_inflight_free_all to avoid leaking refs
-INLINE void release_client_inflight_refs(struct broker *b, struct client_slot *c) {
-    if (c->inflight_count == 0) {
-        return;
-    }
-
-    u16 found = 0;
-    for (u16 i = 0; i < LLMQ_MAX_INFLIGHT && found < c->inflight_count; i++) {
-        struct inflight_msg *inf = &c->inflight[i];
-        if (inf->state == INFLIGHT_FREE) {
-            continue;
-        }
-        found++;
-
-        // Release message reference for outgoing QoS > 0 messages
-        // (incoming QoS 2 messages tracked with direction=1 don't hold refs)
-        if (inf->direction == 0 && inf->msg_idx != MSG_POOL_INVALID) {
-            release_msg_ref(b, inf->msg_idx);
-        }
-    }
-}
-
 // Include handler after submit functions are defined
+// Note: handler.h includes mqtt_fsm.h which provides fsm_client_disconnect, fsm_sweep_all_timeouts
 #include "broker/handler.h"
 
 // =============================================================================
@@ -450,8 +428,8 @@ INLINE void handle_close(struct broker *b, struct io_uring_cqe *cqe) {
         log_debug("disconnect fd=%d slot=%d clean=%d", fd, slot_idx, c->clean_session);
 
         // Release message refs for pending inflight entries before cleanup
-        // These are messages we never got ACKs for
-        release_client_inflight_refs(b, c);
+        // FSM handles releasing refs for messages we never got ACKs for
+        fsm_client_disconnect(b, c);
 
         if (c->clean_session) {
             broker_free_slot(b, (u32)slot_idx);
@@ -540,50 +518,7 @@ INLINE u32 process_recv_retries(struct broker *b) {
 // Timeout Sweep - cleanup expired inflight entries
 // =============================================================================
 
-// Sweep a single client for expired inflight entries
-// Returns number of entries timed out
-INLINE u32 sweep_client_inflight(struct broker *b, struct client_slot *c, u64 now) {
-    if (c->state != CLIENT_ACTIVE || c->inflight_count == 0) {
-        return 0;
-    }
-
-    u32 timed_out = 0;
-    u16 found     = 0;
-
-    for (u16 i = 0; i < LLMQ_MAX_INFLIGHT && found < c->inflight_count; i++) {
-        struct inflight_msg *inf = &c->inflight[i];
-        if (inf->state == INFLIGHT_FREE) {
-            continue;
-        }
-        found++;
-
-        // Check deadline (0 = no timeout)
-        if (inf->deadline != 0 && now > inf->deadline) {
-            // Entry expired - release message reference (for QoS > 0)
-            // This is the "give up" path - message wasn't ACKed in time
-            release_msg_ref(b, inf->msg_idx);
-            inf->msg_idx       = MSG_POOL_INVALID;
-            inf->send_desc_idx = SEND_DESC_INVALID;
-            inf->state         = INFLIGHT_FREE;
-            c->inflight_count--;
-            timed_out++;
-        }
-    }
-
-    return timed_out;
-}
-
-// Sweep all clients for expired inflight entries
-// Called periodically from event loop
-INLINE u32 broker_sweep_timeouts(struct broker *b) {
-    u32 total_timed_out = 0;
-
-    for (u32 i = 0; i < b->max_clients; i++) {
-        total_timed_out += sweep_client_inflight(b, &b->clients[i], b->now);
-    }
-
-    return total_timed_out;
-}
+// Note: timeout sweep functions moved to mqtt_fsm.h (fsm_sweep_client, fsm_sweep_all_timeouts)
 
 // Log pool utilization stats
 INLINE void log_pool_stats(struct broker *b) {
@@ -641,11 +576,11 @@ INLINE i32 broker_run(struct broker *b) {
 
         process_recv_retries(b);
 
-        // Periodic timeout sweep
+        // Periodic timeout sweep - FSM handles retransmission or cleanup
         if (b->now - b->last_timeout_sweep >= LLMQ_TIMEOUT_SWEEP_INTERVAL_MS) {
-            u32 timed_out = broker_sweep_timeouts(b);
-            if (timed_out > 0) {
-                log_debug("Timeout sweep: %u inflight entries expired", timed_out);
+            u32 processed_timeouts = fsm_sweep_all_timeouts(b);
+            if (processed_timeouts > 0) {
+                log_debug("Timeout sweep: %u inflight entries processed", processed_timeouts);
             }
             b->last_timeout_sweep = b->now;
         }
