@@ -116,7 +116,7 @@ INLINE void msg_pool_cleanup(struct msg_pool *p) {
 
 // Get message by index
 INLINE struct canonical_msg *msg_pool_get(struct msg_pool *p, u32 idx) {
-    if (idx >= p->capacity) {
+    if (unlikely(idx >= p->capacity)) {
         return NULL;
     }
     return &p->msgs[idx];
@@ -124,14 +124,14 @@ INLINE struct canonical_msg *msg_pool_get(struct msg_pool *p, u32 idx) {
 
 // Allocate a message slot, returns index or MSG_POOL_INVALID
 INLINE u32 msg_pool_alloc(struct msg_pool *p) {
-    if (p->free_count == 0) {
+    if (unlikely(p->free_count == 0)) {
         return MSG_POOL_INVALID;
     }
     p->free_count--;
 
     // Track high water mark
     u32 used = p->capacity - p->free_count;
-    if (used > p->high_water) {
+    if (unlikely(used > p->high_water)) {
         p->high_water = used;
     }
 
@@ -144,7 +144,7 @@ INLINE u32 msg_pool_alloc(struct msg_pool *p) {
 
 // Free a message slot back to pool
 INLINE void msg_pool_free(struct msg_pool *p, u32 idx) {
-    if (idx >= p->capacity) {
+    if (unlikely(idx >= p->capacity)) {
         return;
     }
     p->free_stack[p->free_count] = idx;
@@ -153,7 +153,7 @@ INLINE void msg_pool_free(struct msg_pool *p, u32 idx) {
 
 // Increment reference count (call before each subscriber send)
 INLINE void msg_pool_ref(struct msg_pool *p, u32 idx) {
-    if (idx >= p->capacity) {
+    if (unlikely(idx >= p->capacity)) {
         return;
     }
     atomic_inc(&p->msgs[idx].ref_count);
@@ -162,7 +162,7 @@ INLINE void msg_pool_ref(struct msg_pool *p, u32 idx) {
 // Decrement reference count
 // Returns: new ref count (0 means caller should free the message and stolen buffer)
 INLINE u32 msg_pool_unref(struct msg_pool *p, u32 idx) {
-    if (idx >= p->capacity) {
+    if (unlikely(idx >= p->capacity)) {
         return 0;
     }
     return atomic_dec(&p->msgs[idx].ref_count);
@@ -170,7 +170,7 @@ INLINE u32 msg_pool_unref(struct msg_pool *p, u32 idx) {
 
 // Get current ref count
 INLINE u32 msg_pool_refcount(struct msg_pool *p, u32 idx) {
-    if (idx >= p->capacity) {
+    if (unlikely(idx >= p->capacity)) {
         return 0;
     }
     return atomic_load(&p->msgs[idx].ref_count);
@@ -312,7 +312,7 @@ INLINE void send_desc_pool_cleanup(struct send_desc_pool *p) {
 
 // Get send descriptor by index
 INLINE struct send_desc *send_desc_pool_get(struct send_desc_pool *p, u32 idx) {
-    if (idx >= p->capacity) {
+    if (unlikely(idx >= p->capacity)) {
         return NULL;
     }
     return &p->descs[idx];
@@ -321,8 +321,8 @@ INLINE struct send_desc *send_desc_pool_get(struct send_desc_pool *p, u32 idx) {
 // Allocate a send descriptor, returns index or SEND_DESC_INVALID
 // Automatically grows pool if needed and possible
 INLINE u32 send_desc_pool_alloc(struct send_desc_pool *p) {
-    // Try to grow if exhausted
-    if (p->free_count == 0) {
+    // Try to grow if exhausted (rare path after initial sizing)
+    if (unlikely(p->free_count == 0)) {
         if (!send_desc_pool_grow(p)) {
             return SEND_DESC_INVALID; // At max capacity
         }
@@ -332,7 +332,7 @@ INLINE u32 send_desc_pool_alloc(struct send_desc_pool *p) {
 
     // Track high water mark
     u32 used = p->capacity - p->free_count;
-    if (used > p->high_water) {
+    if (unlikely(used > p->high_water)) {
         p->high_water = used;
     }
 
@@ -346,7 +346,7 @@ INLINE u32 send_desc_pool_alloc(struct send_desc_pool *p) {
 
 // Free a send descriptor back to pool
 INLINE void send_desc_pool_free(struct send_desc_pool *p, u32 idx) {
-    if (idx >= p->capacity) {
+    if (unlikely(!p->descs || idx >= p->capacity)) {
         return;
     }
     p->descs[idx].state          = SEND_FREE;

@@ -13,7 +13,9 @@ i32 ring_init(struct ring *r, u32 entries) {
     memset(&p, 0, sizeof(p));
 
     // Request features for better performance
-    p.flags = IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN;
+    // COOP_TASKRUN: Allow task work in any kernel context (lower latency than DEFER_TASKRUN)
+    // SINGLE_ISSUER: Only one task will submit - allows optimizations
+    p.flags = IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_COOP_TASKRUN;
 
     // Create the ring
     i32 fd = sys_io_uring_setup(entries, &p);

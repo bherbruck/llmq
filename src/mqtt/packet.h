@@ -151,7 +151,7 @@ struct mqtt_fixed_header {
 // Parse fixed header from buffer
 // Returns: header_len on success, or mqtt_parse_result on error
 INLINE i32 mqtt_parse_fixed_header(const u8 *buf, u32 len, struct mqtt_fixed_header *hdr) {
-    if (len < 2) {
+    if (unlikely(len < 2)) {
         return MQTT_INCOMPLETE;
     }
 
@@ -164,10 +164,10 @@ INLINE i32 mqtt_parse_fixed_header(const u8 *buf, u32 len, struct mqtt_fixed_hea
     u32 pos        = 1;
 
     for (;;) {
-        if (pos >= len) {
+        if (unlikely(pos >= len)) {
             return MQTT_INCOMPLETE;
         }
-        if (pos > MQTT_VBI_MAX_BYTES) {
+        if (unlikely(pos > MQTT_VBI_MAX_BYTES)) {
             return MQTT_ERR_MALFORMED; // VBI too long
         }
 
@@ -175,7 +175,8 @@ INLINE i32 mqtt_parse_fixed_header(const u8 *buf, u32 len, struct mqtt_fixed_hea
         value += (byte & MQTT_VBI_MASK) * multiplier;
         multiplier <<= MQTT_VBI_SHIFT;
 
-        if ((byte & MQTT_VBI_CONTINUE) == 0) {
+        // Most packets have 1-2 byte remaining length
+        if (likely((byte & MQTT_VBI_CONTINUE) == 0)) {
             break;
         }
     }
@@ -190,12 +191,12 @@ INLINE i32 mqtt_parse_fixed_header(const u8 *buf, u32 len, struct mqtt_fixed_hea
 INLINE i32 mqtt_packet_complete(const u8 *buf, u32 len) {
     struct mqtt_fixed_header hdr;
     i32 rc = mqtt_parse_fixed_header(buf, len, &hdr);
-    if (rc < 0) {
+    if (unlikely(rc < 0)) {
         return rc;
     }
 
     u32 total = hdr.header_len + hdr.remaining_len;
-    if (len < total) {
+    if (unlikely(len < total)) {
         return MQTT_INCOMPLETE;
     }
 

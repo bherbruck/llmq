@@ -44,6 +44,7 @@ enum inflight_state {
 struct inflight_msg {
     u32 msg_idx;         // Index into canonical_msg pool (MSG_POOL_INVALID if none)
     u32 send_desc_idx;   // Active send_desc (SEND_DESC_INVALID if not sending)
+    u64 deadline;        // Monotonic timestamp for timeout (0 = no timeout)
     u16 packet_id;       // MQTT packet identifier (native endian for lookups)
     u8 packet_id_be[2];  // Big-endian packet ID for protocol responses
     u8 state;            // enum inflight_state
@@ -52,7 +53,7 @@ struct inflight_msg {
     u8 direction;        // 0 = outgoing (we sent), 1 = incoming (we received)
 };
 
-STATIC_ASSERT(sizeof(struct inflight_msg) == 16, "inflight_msg should be 16 bytes");
+STATIC_ASSERT(sizeof(struct inflight_msg) == 24, "inflight_msg should be 24 bytes");
 
 // =============================================================================
 // Pending Message (for offline QoS 1/2 delivery)
@@ -294,20 +295,23 @@ INLINE void client_pending_pop(struct client_slot *c) {
 
 // Allocate inflight slot for QoS 1/2 message - O(1) using direct indexing
 // Packet ID is chosen so that (packet_id - 1) % max_inflight = slot_index
+// deadline: monotonic timestamp when this entry expires (0 = no timeout)
 // Returns: inflight index (>=0), or INFLIGHT_ERR_CLIENT_FULL
-INLINE i32 client_inflight_alloc(struct client_slot *c, u8 qos, u32 msg_idx, u16 *out_packet_id) {
-    if (c->inflight_count >= c->max_inflight) {
+INLINE i32 client_inflight_alloc(struct client_slot *c, u8 qos, u32 msg_idx, u64 deadline,
+                                  u16 *out_packet_id) {
+    if (unlikely(c->inflight_count >= c->max_inflight)) {
         return INFLIGHT_ERR_CLIENT_FULL;
     }
 
     // Find free slot using free list hint, fall back to linear if needed
     u16 slot = c->inflight_free_hint;
     u16 searched = 0;
-    while (c->inflight[slot].state != INFLIGHT_FREE && searched < c->max_inflight) {
+    // Hot path: free_hint usually points to free slot
+    while (unlikely(c->inflight[slot].state != INFLIGHT_FREE) && searched < c->max_inflight) {
         slot = (slot + 1) % c->max_inflight;
         searched++;
     }
-    if (c->inflight[slot].state != INFLIGHT_FREE) {
+    if (unlikely(c->inflight[slot].state != INFLIGHT_FREE)) {
         return -1; // Should never happen if count is accurate
     }
 
@@ -318,8 +322,8 @@ INLINE i32 client_inflight_alloc(struct client_slot *c, u8 qos, u32 msg_idx, u16
     u16 packet_id = base_id + (c->inflight_generation * c->max_inflight);
     if (packet_id == 0) packet_id = base_id; // Avoid 0
 
-    *out_packet_id           = packet_id;
-    c->inflight[slot].packet_id = packet_id;
+    *out_packet_id                    = packet_id;
+    c->inflight[slot].packet_id       = packet_id;
     c->inflight[slot].packet_id_be[0] = (u8)(packet_id >> 8);
     c->inflight[slot].packet_id_be[1] = (u8)(packet_id & 0xFF);
     c->inflight[slot].qos             = qos;
@@ -327,6 +331,7 @@ INLINE i32 client_inflight_alloc(struct client_slot *c, u8 qos, u32 msg_idx, u16
     c->inflight[slot].direction       = 0; // outgoing
     c->inflight[slot].msg_idx         = msg_idx;
     c->inflight[slot].send_desc_idx   = SEND_DESC_INVALID;
+    c->inflight[slot].deadline        = deadline;
     c->inflight[slot].state           = (qos == 1) ? INFLIGHT_WAIT_PUBACK : INFLIGHT_WAIT_PUBREC;
 
     c->inflight_count++;
@@ -341,12 +346,20 @@ INLINE i32 client_inflight_alloc(struct client_slot *c, u8 qos, u32 msg_idx, u16
 }
 
 // Track incoming QoS 2 message (no buffer needed - we're receiving, not sending)
-INLINE i32 client_inflight_track_incoming(struct client_slot *c, u16 packet_id) {
+// Optimized: use packet_id % max_inflight as hint for both duplicate check and allocation
+// deadline: monotonic timestamp when this entry expires (0 = no timeout)
+INLINE i32 client_inflight_track_incoming(struct client_slot *c, u16 packet_id, u64 deadline) {
     if (c->inflight_count >= c->max_inflight) {
         return -1;
     }
 
-    // Check for duplicate
+    // Check for duplicate - O(1) hint first, then linear fallback
+    u16 hint = (packet_id - 1) % c->max_inflight;
+    if (c->inflight[hint].state != INFLIGHT_FREE && c->inflight[hint].packet_id == packet_id &&
+        c->inflight[hint].direction == 1) {
+        return (i32)hint; // Found duplicate at hint slot
+    }
+    // Linear fallback for duplicate check (rare if clients use sequential IDs)
     for (u16 i = 0; i < c->max_inflight; i++) {
         if (c->inflight[i].state != INFLIGHT_FREE && c->inflight[i].packet_id == packet_id &&
             c->inflight[i].direction == 1) {
@@ -354,33 +367,40 @@ INLINE i32 client_inflight_track_incoming(struct client_slot *c, u16 packet_id) 
         }
     }
 
-    // Find free slot
-    for (u16 i = 0; i < c->max_inflight; i++) {
-        if (c->inflight[i].state == INFLIGHT_FREE) {
-            c->inflight[i].packet_id       = packet_id;
-            c->inflight[i].packet_id_be[0] = (u8)(packet_id >> 8);
-            c->inflight[i].packet_id_be[1] = (u8)(packet_id & 0xFF);
-            c->inflight[i].qos             = 2;
-            c->inflight[i].dup_count       = 0;
-            c->inflight[i].direction       = 1;                  // incoming
-            c->inflight[i].msg_idx         = MSG_POOL_INVALID;   // No buffer needed
-            c->inflight[i].send_desc_idx   = SEND_DESC_INVALID;
-            c->inflight[i].state           = INFLIGHT_WAIT_PUBREL;
-            c->inflight_count++;
-            return (i32)i;
-        }
+    // Find free slot - use free_hint for O(1) typical case
+    u16 slot = c->inflight_free_hint;
+    u16 searched = 0;
+    while (c->inflight[slot].state != INFLIGHT_FREE && searched < c->max_inflight) {
+        slot = (slot + 1) % c->max_inflight;
+        searched++;
     }
-    return -1;
+    if (c->inflight[slot].state != INFLIGHT_FREE) {
+        return -1; // No free slots
+    }
+
+    c->inflight[slot].packet_id       = packet_id;
+    c->inflight[slot].packet_id_be[0] = (u8)(packet_id >> 8);
+    c->inflight[slot].packet_id_be[1] = (u8)(packet_id & 0xFF);
+    c->inflight[slot].qos             = 2;
+    c->inflight[slot].dup_count       = 0;
+    c->inflight[slot].direction       = 1;                  // incoming
+    c->inflight[slot].msg_idx         = MSG_POOL_INVALID;   // No buffer needed
+    c->inflight[slot].send_desc_idx   = SEND_DESC_INVALID;
+    c->inflight[slot].deadline        = deadline;
+    c->inflight[slot].state           = INFLIGHT_WAIT_PUBREL;
+    c->inflight_count++;
+    c->inflight_free_hint = (slot + 1) % c->max_inflight;
+    return (i32)slot;
 }
 
 // Find inflight entry by packet ID - O(1) for outgoing messages
 // Uses direct indexing: slot = (packet_id - 1) % max_inflight
 INLINE struct inflight_msg *client_inflight_find(struct client_slot *c, u16 packet_id) {
-    if (packet_id == 0) return NULL;
+    if (unlikely(packet_id == 0)) return NULL;
 
     // Direct index for O(1) lookup (works for outgoing messages we assigned)
     u16 slot = (packet_id - 1) % c->max_inflight;
-    if (c->inflight[slot].state != INFLIGHT_FREE && c->inflight[slot].packet_id == packet_id) {
+    if (likely(c->inflight[slot].state != INFLIGHT_FREE && c->inflight[slot].packet_id == packet_id)) {
         return &c->inflight[slot];
     }
 
@@ -408,14 +428,22 @@ INLINE void client_inflight_free(struct client_slot *c, struct inflight_msg *msg
 // Free all inflight entries for a client
 // Note: Caller must handle msg_pool refcounts separately
 INLINE void client_inflight_free_all(struct client_slot *c) {
-    for (u16 i = 0; i < LLMQ_MAX_INFLIGHT; i++) {
+    // Early exit if nothing to free
+    if (c->inflight_count == 0) {
+        return;
+    }
+    // O(max_inflight) but only iterates until we've found all active entries
+    u16 found = 0;
+    for (u16 i = 0; i < LLMQ_MAX_INFLIGHT && found < c->inflight_count; i++) {
         if (c->inflight[i].state != INFLIGHT_FREE) {
             c->inflight[i].msg_idx       = MSG_POOL_INVALID;
             c->inflight[i].send_desc_idx = SEND_DESC_INVALID;
             c->inflight[i].state         = INFLIGHT_FREE;
+            found++;
         }
     }
-    c->inflight_count = 0;
+    c->inflight_count     = 0;
+    c->inflight_free_hint = 0; // Reset hint since all are free
 }
 
 #endif // BROKER_CLIENT_H

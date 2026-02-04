@@ -12,7 +12,7 @@ TEST(inflight_alloc_qos1) {
     client_init(&c, 10, BUF_POOL_INVALID, LLMQ_MAX_INFLIGHT);
 
     u16 packet_id;
-    i32 idx = client_inflight_alloc(&c, 1, MSG_POOL_INVALID, &packet_id);
+    i32 idx = client_inflight_alloc(&c, 1, MSG_POOL_INVALID, 0, &packet_id);
 
     ASSERT(idx >= 0);
     ASSERT(packet_id > 0);
@@ -30,7 +30,7 @@ TEST(inflight_alloc_qos2) {
     client_init(&c, 10, BUF_POOL_INVALID, LLMQ_MAX_INFLIGHT);
 
     u16 packet_id;
-    i32 idx = client_inflight_alloc(&c, 2, MSG_POOL_INVALID, &packet_id);
+    i32 idx = client_inflight_alloc(&c, 2, MSG_POOL_INVALID, 0, &packet_id);
 
     ASSERT(idx >= 0);
     ASSERT(packet_id > 0);
@@ -47,7 +47,7 @@ TEST(inflight_alloc_unique_packet_ids) {
 
     u16 ids[LLMQ_MAX_INFLIGHT];
     for (u16 i = 0; i < LLMQ_MAX_INFLIGHT; i++) {
-        i32 idx = client_inflight_alloc(&c, 1, MSG_POOL_INVALID, &ids[i]);
+        i32 idx = client_inflight_alloc(&c, 1, MSG_POOL_INVALID, 0, &ids[i]);
         ASSERT(idx >= 0);
     }
 
@@ -68,13 +68,13 @@ TEST(inflight_alloc_full) {
     // Fill up inflight slots
     for (u16 i = 0; i < LLMQ_MAX_INFLIGHT; i++) {
         u16 packet_id;
-        i32 idx = client_inflight_alloc(&c, 1, MSG_POOL_INVALID, &packet_id);
+        i32 idx = client_inflight_alloc(&c, 1, MSG_POOL_INVALID, 0, &packet_id);
         ASSERT(idx >= 0);
     }
 
     // Next allocation should fail
     u16 packet_id;
-    i32 idx = client_inflight_alloc(&c, 1, MSG_POOL_INVALID, &packet_id);
+    i32 idx = client_inflight_alloc(&c, 1, MSG_POOL_INVALID, 0, &packet_id);
     ASSERT(idx == -1);
 
     client_inflight_free_all(&c);
@@ -89,7 +89,7 @@ TEST(inflight_find) {
     client_init(&c, 10, BUF_POOL_INVALID, LLMQ_MAX_INFLIGHT);
 
     u16 packet_id;
-    client_inflight_alloc(&c, 1, MSG_POOL_INVALID, &packet_id);
+    client_inflight_alloc(&c, 1, MSG_POOL_INVALID, 0, &packet_id);
 
     struct inflight_msg *found = client_inflight_find(&c, packet_id);
     ASSERT(found != NULL);
@@ -107,7 +107,7 @@ TEST(inflight_free) {
     client_init(&c, 10, BUF_POOL_INVALID, LLMQ_MAX_INFLIGHT);
 
     u16 packet_id;
-    client_inflight_alloc(&c, 1, MSG_POOL_INVALID, &packet_id);
+    client_inflight_alloc(&c, 1, MSG_POOL_INVALID, 0, &packet_id);
     ASSERT(c.inflight_count == 1);
 
     struct inflight_msg *msg = client_inflight_find(&c, packet_id);
@@ -127,13 +127,13 @@ TEST(inflight_reuse_after_free) {
 
     // Allocate and free
     u16 packet_id1;
-    client_inflight_alloc(&c, 1, MSG_POOL_INVALID, &packet_id1);
+    client_inflight_alloc(&c, 1, MSG_POOL_INVALID, 0, &packet_id1);
     struct inflight_msg *msg = client_inflight_find(&c, packet_id1);
     client_inflight_free(&c, msg);
 
     // Should be able to allocate again
     u16 packet_id2;
-    i32 idx2 = client_inflight_alloc(&c, 1, MSG_POOL_INVALID, &packet_id2);
+    i32 idx2 = client_inflight_alloc(&c, 1, MSG_POOL_INVALID, 0, &packet_id2);
     ASSERT(idx2 >= 0);
     ASSERT(c.inflight_count == 1);
 
@@ -148,7 +148,7 @@ TEST(inflight_track_incoming) {
     struct client_slot c;
     client_init(&c, 10, BUF_POOL_INVALID, LLMQ_MAX_INFLIGHT);
 
-    i32 idx = client_inflight_track_incoming(&c, 42);
+    i32 idx = client_inflight_track_incoming(&c, 42, 0);
 
     ASSERT(idx >= 0);
     ASSERT(c.inflight_count == 1);
@@ -165,8 +165,8 @@ TEST(inflight_track_incoming_duplicate) {
     client_init(&c, 10, BUF_POOL_INVALID, LLMQ_MAX_INFLIGHT);
 
     // Track same packet ID twice (simulating DUP PUBLISH)
-    i32 idx1 = client_inflight_track_incoming(&c, 42);
-    i32 idx2 = client_inflight_track_incoming(&c, 42);
+    i32 idx1 = client_inflight_track_incoming(&c, 42, 0);
+    i32 idx2 = client_inflight_track_incoming(&c, 42, 0);
 
     // Should return same index, not create new entry
     ASSERT(idx1 == idx2);
@@ -185,7 +185,7 @@ TEST(qos1_state_transition) {
 
     // Allocate QoS 1 - starts in WAIT_PUBACK
     u16 packet_id;
-    client_inflight_alloc(&c, 1, MSG_POOL_INVALID, &packet_id);
+    client_inflight_alloc(&c, 1, MSG_POOL_INVALID, 0, &packet_id);
     struct inflight_msg *msg = client_inflight_find(&c, packet_id);
 
     ASSERT(msg->state == INFLIGHT_WAIT_PUBACK);
@@ -201,7 +201,7 @@ TEST(qos2_outgoing_state_transitions) {
 
     // Allocate QoS 2 outgoing - starts in WAIT_PUBREC
     u16 packet_id;
-    client_inflight_alloc(&c, 2, MSG_POOL_INVALID, &packet_id);
+    client_inflight_alloc(&c, 2, MSG_POOL_INVALID, 0, &packet_id);
     struct inflight_msg *msg = client_inflight_find(&c, packet_id);
 
     ASSERT(msg->state == INFLIGHT_WAIT_PUBREC);
@@ -220,7 +220,7 @@ TEST(qos2_incoming_state_transitions) {
     client_init(&c, 10, BUF_POOL_INVALID, LLMQ_MAX_INFLIGHT);
 
     // Track incoming QoS 2 - starts in WAIT_PUBREL
-    client_inflight_track_incoming(&c, 100);
+    client_inflight_track_incoming(&c, 100, 0);
     struct inflight_msg *msg = client_inflight_find(&c, 100);
 
     ASSERT(msg->state == INFLIGHT_WAIT_PUBREL);

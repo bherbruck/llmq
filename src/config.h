@@ -98,6 +98,22 @@
 #define LLMQ_FLUSH_BATCH_LIMIT 256 // Max CQEs to process when flushing for SQ space
 
 // =============================================================================
+// Timeouts (milliseconds)
+// =============================================================================
+
+#ifndef LLMQ_INFLIGHT_TIMEOUT_MS
+#define LLMQ_INFLIGHT_TIMEOUT_MS 30000 // 30 seconds for QoS ACK
+#endif
+
+#ifndef LLMQ_TIMEOUT_SWEEP_INTERVAL_MS
+#define LLMQ_TIMEOUT_SWEEP_INTERVAL_MS 5000 // Check for timeouts every 5 seconds
+#endif
+
+#ifndef LLMQ_STATS_LOG_INTERVAL
+#define LLMQ_STATS_LOG_INTERVAL 50000 // Log pool stats every N CQEs processed
+#endif
+
+// =============================================================================
 // Numeric Constants
 // =============================================================================
 

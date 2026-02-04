@@ -14,10 +14,11 @@
 #include "mqtt/publish.h"
 #include "util/log.h"
 
-// Forward declare submit functions (defined in loop.h which includes this file)
+// Forward declare functions (defined in loop.h which includes this file)
 INLINE void submit_send(struct broker *b, i32 fd, const u8 *buf, u32 len);
 INLINE void submit_send_zc(struct broker *b, i32 fd, u32 send_desc_idx);
 INLINE void submit_send_writev_simple(struct broker *b, i32 fd, struct iovec *iov, u32 nr_vecs);
+INLINE void release_msg_ref(struct broker *b, u32 msg_idx);
 
 // Static headers for zero-copy protocol responses (type<<4 | flags, remaining_len)
 static const u8 HDR_CONNACK[4]  = {0x20, 0x02, 0x00, 0x00}; // Session=0, accepted
@@ -91,7 +92,7 @@ static i32 forward_publish_zc(struct broker *b, u32 slot_idx, struct client_slot
 
     // Allocate send descriptor
     u32 sd_idx = send_desc_pool_alloc(&b->send_desc_pool);
-    if (sd_idx == SEND_DESC_INVALID) {
+    if (unlikely(sd_idx == SEND_DESC_INVALID)) {
         b->msgs_dropped++;
         b->drops_send_desc_empty++;
         return -1;
@@ -106,8 +107,9 @@ static i32 forward_publish_zc(struct broker *b, u32 slot_idx, struct client_slot
     // For QoS 1/2, allocate packet ID and track in inflight
     if (effective_qos > 0) {
         u16 packet_id = 0;
-        i32 inf_idx   = client_inflight_alloc(sub, effective_qos, pctx->msg_idx, &packet_id);
-        if (inf_idx < 0) {
+        u64 deadline  = b->now + LLMQ_INFLIGHT_TIMEOUT_MS;
+        i32 inf_idx   = client_inflight_alloc(sub, effective_qos, pctx->msg_idx, deadline, &packet_id);
+        if (unlikely(inf_idx < 0)) {
             send_desc_pool_free(&b->send_desc_pool, sd_idx);
             b->msgs_dropped++;
             b->drops_inflight_full++;
@@ -152,7 +154,7 @@ static void publish_node_cb(void *ctx, struct trie_node *node) {
 
     // Pre-fetch message once for all subscribers (was being fetched 2x per subscriber!)
     struct canonical_msg *msg = msg_pool_get(&b->msg_pool, pctx->msg_idx);
-    if (!msg) {
+    if (unlikely(!msg)) {
         return;
     }
     u8 pub_qos = msg->qos; // Cache for loop
@@ -160,6 +162,7 @@ static void publish_node_cb(void *ctx, struct trie_node *node) {
     // Iterate slots in this node
     for (u32 slot = 0; slot < TRIE_FD_SLOTS; slot++) {
         u64 bits = node->fd_bitmap[slot] & ~pctx->sent_bitmap[slot];
+        if (likely(bits == 0)) continue; // Skip empty slots quickly
 
         while (bits) {
             u32 bit_idx  = (u32)__builtin_ctzll(bits);
@@ -170,14 +173,13 @@ static void publish_node_cb(void *ctx, struct trie_node *node) {
 
             // Get client slot (unchecked: slot_idx from bitmap, always < max_clients)
             struct client_slot *c = broker_get_client_unchecked(b, slot_idx);
-            if (c->state != CLIENT_ACTIVE) {
-                // TODO: Queue for DORMANT clients
+            if (unlikely(c->state != CLIENT_ACTIVE)) {
+                // Skip dormant/closing clients
                 bits &= bits - 1;
                 continue;
             }
 
             // Forward the publish using zero-copy
-            // TODO: Get per-subscription QoS from trie node
             forward_publish_zc(b, slot_idx, c, pctx, msg, pub_qos);
 
             bits &= bits - 1; // Clear lowest bit
@@ -227,7 +229,7 @@ INLINE i32 process_mqtt_packet(struct broker *b, struct client_slot *c, const u8
             return -1;
         }
 
-        client_set_identity(c, conn_pkt.client_id.ptr, (u8)conn_pkt.client_id.len);
+        broker_set_client_identity(b, (u32)slot_idx, conn_pkt.client_id.ptr, (u8)conn_pkt.client_id.len);
         c->protocol_version = conn_pkt.protocol_version;
         c->keepalive        = conn_pkt.keepalive;
         c->clean_session    = conn_pkt.clean_session;
@@ -273,7 +275,8 @@ INLINE i32 process_mqtt_packet(struct broker *b, struct client_slot *c, const u8
         struct inflight_msg *inf = client_inflight_find(c, packet_id);
         if (inf && inf->state == INFLIGHT_WAIT_PUBACK) {
             log_debug("PUBACK fd=%d packet_id=%d - delivery complete", c->fd, packet_id);
-            // Note: msg_pool refcount is decremented during send completion
+            // QoS 1 ceremony complete - release message reference
+            release_msg_ref(b, inf->msg_idx);
             client_inflight_free(c, inf);
         } else {
             log_debug("PUBACK fd=%d packet_id=%d - unexpected", c->fd, packet_id);
@@ -326,6 +329,8 @@ INLINE i32 process_mqtt_packet(struct broker *b, struct client_slot *c, const u8
         struct inflight_msg *inf = client_inflight_find(c, packet_id);
         if (inf && inf->state == INFLIGHT_WAIT_PUBCOMP) {
             log_debug("PUBCOMP fd=%d packet_id=%d - delivery complete", c->fd, packet_id);
+            // QoS 2 ceremony complete - release message reference
+            release_msg_ref(b, inf->msg_idx);
             client_inflight_free(c, inf);
         } else {
             log_debug("PUBCOMP fd=%d packet_id=%d - unexpected", c->fd, packet_id);
@@ -425,7 +430,8 @@ INLINE i32 process_mqtt_packet(struct broker *b, struct client_slot *c, const u8
                 break; // Don't re-fan-out duplicate
             }
 
-            i32 inf_idx = client_inflight_track_incoming(c, pub_pkt.packet_id);
+            u64 deadline = b->now + LLMQ_INFLIGHT_TIMEOUT_MS;
+            i32 inf_idx = client_inflight_track_incoming(c, pub_pkt.packet_id, deadline);
             if (inf_idx < 0) {
                 log_debug("PUBLISH fd=%d qos=2 - inflight full, dropping", c->fd);
                 return -1;

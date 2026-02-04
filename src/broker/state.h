@@ -10,6 +10,7 @@
 #include "broker/client.h"
 #include "broker/trie.h"
 #include "mem/msgbuf.h"
+#include "mem/hashmap.h"
 #include "config.h"
 
 // =============================================================================
@@ -53,6 +54,13 @@ struct broker {
 
     // Topic trie for subscription matching
     struct topic_trie trie;
+
+    // Client ID hash table for O(1) session lookup
+    struct hashmap client_map;
+
+    // Timing
+    u64 now;           // Current monotonic time in ms (updated each event loop iteration)
+    u64 last_timeout_sweep; // Last time we swept for expired inflight entries
 
     // Stats
     u64 accepts;
@@ -161,6 +169,17 @@ INLINE i32 broker_init(struct broker *b, u32 max_clients, u32 max_fds, u16 max_i
     // Initialize trie
     trie_init(&b->trie);
 
+    // Initialize client_id hash table (sized for 2x max_clients for low load factor)
+    if (hashmap_init(&b->client_map, max_clients * 2) < 0) {
+        sys_munmap(b->fd_to_slot, fd_map_size);
+        sys_munmap(b->clients, clients_size);
+        sys_munmap(b->recv_retry_queue, retry_size);
+        buf_pool_cleanup(&b->recv_pool);
+        msg_pool_cleanup(&b->msg_pool);
+        send_desc_pool_cleanup(&b->send_desc_pool);
+        return -1;
+    }
+
     return 0;
 }
 
@@ -190,6 +209,7 @@ INLINE void broker_cleanup(struct broker *b) {
     buf_pool_cleanup(&b->recv_pool);
     msg_pool_cleanup(&b->msg_pool);
     send_desc_pool_cleanup(&b->send_desc_pool);
+    hashmap_cleanup(&b->client_map);
 }
 
 // =============================================================================
@@ -259,10 +279,21 @@ INLINE i32 broker_alloc_slot(struct broker *b, i32 fd) {
     return (i32)slot_idx;
 }
 
-// Find existing slot by client ID (for session resume)
+// Find existing slot by client ID (for session resume) - O(1) via hash table
 INLINE i32 broker_find_slot(struct broker *b, const u8 *client_id, u8 len) {
     u32 hash = fnv1a(client_id, len);
 
+    // O(1) hash table lookup
+    u32 slot_idx = hashmap_find(&b->client_map, hash);
+    if (likely(slot_idx != HASHMAP_EMPTY)) {
+        // Verify full match (hash collision possible)
+        if (client_matches(&b->clients[slot_idx], client_id, len, hash)) {
+            return (i32)slot_idx;
+        }
+        // Hash collision - fall through to linear search (rare)
+    }
+
+    // Fallback linear search for hash collisions (very rare with good hash)
     for (u32 i = 0; i < b->max_clients; i++) {
         if (client_matches(&b->clients[i], client_id, len, hash)) {
             return (i32)i;
@@ -294,9 +325,23 @@ INLINE struct client_slot *broker_get_client_unchecked(struct broker *b, u32 slo
     return &b->clients[slot_idx];
 }
 
+// Set client identity and add to hash table for O(1) lookup
+// Call this after CONNECT packet is received
+INLINE void broker_set_client_identity(struct broker *b, u32 slot_idx, const u8 *client_id, u8 len) {
+    struct client_slot *c = &b->clients[slot_idx];
+    client_set_identity(c, client_id, len);
+    // Add to hash table for O(1) session lookup
+    hashmap_insert(&b->client_map, c->client_id_hash, slot_idx);
+}
+
 // Free a slot (clean_session=1 disconnect or takeover)
 INLINE void broker_free_slot(struct broker *b, u32 slot_idx) {
     struct client_slot *c = &b->clients[slot_idx];
+
+    // Remove from client_id hash table if they had an identity
+    if (c->client_id_len > 0) {
+        hashmap_remove(&b->client_map, c->client_id_hash, slot_idx);
+    }
 
     if (c->state == CLIENT_ACTIVE || c->state == CLIENT_CLOSING) {
         b->active_count--;
@@ -318,7 +363,7 @@ INLINE void broker_free_slot(struct broker *b, u32 slot_idx) {
         b->dormant_count--;
     }
 
-    // Clear inflight entries (msg_pool refs handled separately during send completion)
+    // Clear inflight entries (msg_pool refs released in handle_close before this)
     client_inflight_free_all(c);
 
     // Remove from trie

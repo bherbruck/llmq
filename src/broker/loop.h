@@ -16,10 +16,10 @@
 // Get SQE, flushing to kernel if full (simple non-blocking flush)
 INLINE struct io_uring_sqe *get_sqe_with_flush(struct broker *b) {
     struct io_uring_sqe *sqe = ring_get_sqe(&b->ring);
-    if (sqe)
+    if (likely(sqe))
         return sqe;
 
-    // SQ full - flush pending SQEs to kernel (non-blocking)
+    // SQ full - flush pending SQEs to kernel (non-blocking) - rare path
     ring_submit(&b->ring, 0);
 
     return ring_get_sqe(&b->ring);
@@ -92,17 +92,20 @@ INLINE void submit_send_zc(struct broker *b, i32 fd, u32 send_desc_idx) {
         log_debug("SQ full, dropping zc send fd=%d", fd);
         b->msgs_dropped++;
         b->drops_sq_full++;
-        // Must clean up: decrement refcount, free send_desc
+
         struct send_desc *sd = send_desc_pool_get(&b->send_desc_pool, send_desc_idx);
         if (sd && sd->msg_idx != MSG_POOL_INVALID) {
-            u32 new_ref = msg_pool_unref(&b->msg_pool, sd->msg_idx);
-            if (new_ref == 0) {
-                // Last reference - free the stolen buffer
-                struct canonical_msg *msg = msg_pool_get(&b->msg_pool, sd->msg_idx);
-                if (msg && msg->buf_idx != MSG_POOL_INVALID) {
-                    buf_pool_free(&b->recv_pool, msg->buf_idx);
+            // For QoS 0: release ref now (no inflight entry exists)
+            // For QoS > 0: inflight entry exists and holds the ref - let timeout/disconnect clean it up
+            if (sd->sub_qos == 0) {
+                u32 new_ref = msg_pool_unref(&b->msg_pool, sd->msg_idx);
+                if (new_ref == 0) {
+                    struct canonical_msg *msg = msg_pool_get(&b->msg_pool, sd->msg_idx);
+                    if (msg && msg->buf_idx != MSG_POOL_INVALID) {
+                        buf_pool_free(&b->recv_pool, msg->buf_idx);
+                    }
+                    msg_pool_free(&b->msg_pool, sd->msg_idx);
                 }
-                msg_pool_free(&b->msg_pool, sd->msg_idx);
             }
         }
         send_desc_pool_free(&b->send_desc_pool, send_desc_idx);
@@ -174,6 +177,45 @@ INLINE void submit_close(struct broker *b, i32 fd) {
     ring_submit_sqe(&b->ring);
 }
 
+// Release a message reference (decrement refcount, free if last)
+// Called when QoS ceremony completes (ACK received) or on timeout/disconnect
+INLINE void release_msg_ref(struct broker *b, u32 msg_idx) {
+    if (msg_idx == MSG_POOL_INVALID) {
+        return;
+    }
+    struct canonical_msg *msg = msg_pool_get(&b->msg_pool, msg_idx);
+    u32 new_ref               = msg_pool_unref(&b->msg_pool, msg_idx);
+    if (new_ref == 0 && msg) {
+        if (msg->buf_idx != MSG_POOL_INVALID) {
+            buf_pool_free(&b->recv_pool, msg->buf_idx);
+        }
+        msg_pool_free(&b->msg_pool, msg_idx);
+    }
+}
+
+// Release all message refs for pending inflight entries on disconnect
+// Must be called BEFORE client_inflight_free_all to avoid leaking refs
+INLINE void release_client_inflight_refs(struct broker *b, struct client_slot *c) {
+    if (c->inflight_count == 0) {
+        return;
+    }
+
+    u16 found = 0;
+    for (u16 i = 0; i < LLMQ_MAX_INFLIGHT && found < c->inflight_count; i++) {
+        struct inflight_msg *inf = &c->inflight[i];
+        if (inf->state == INFLIGHT_FREE) {
+            continue;
+        }
+        found++;
+
+        // Release message reference for outgoing QoS > 0 messages
+        // (incoming QoS 2 messages tracked with direction=1 don't hold refs)
+        if (inf->direction == 0 && inf->msg_idx != MSG_POOL_INVALID) {
+            release_msg_ref(b, inf->msg_idx);
+        }
+    }
+}
+
 // Include handler after submit functions are defined
 #include "broker/handler.h"
 
@@ -184,13 +226,13 @@ INLINE void submit_close(struct broker *b, i32 fd) {
 INLINE void handle_accept(struct broker *b, struct io_uring_cqe *cqe) {
     i32 client_fd = cqe->res;
 
-    if (client_fd < 0) {
+    if (unlikely(client_fd < 0)) {
         log_error("accept() failed: %d", client_fd);
         submit_accept(b);
         return;
     }
 
-    if ((u32)client_fd >= b->max_fds) {
+    if (unlikely((u32)client_fd >= b->max_fds)) {
         log_error("fd too large: %d", client_fd);
         sys_close(client_fd);
         submit_accept(b);
@@ -282,13 +324,13 @@ INLINE void handle_recv(struct broker *b, struct io_uring_cqe *cqe) {
 
     // Use slot_idx from user_data to find the slot
     struct client_slot *c = broker_get_client(b, slot_idx);
-    if (!c) {
+    if (unlikely(!c)) {
         return;
     }
 
     // Check generation to detect stale CQEs from previous slot use.
-    // If generation doesn't match, this recv was submitted before the slot was reused.
-    if (c->generation != cqe_gen) {
+    // Stale CQEs are rare - only happen during rapid reconnects
+    if (unlikely(c->generation != cqe_gen)) {
         // Stale CQE - free the orphaned buffer that was saved during slot cleanup
         if (c->orphaned_recv_buf_idx != BUF_POOL_INVALID) {
             buf_pool_free(&b->recv_pool, c->orphaned_recv_buf_idx);
@@ -301,12 +343,13 @@ INLINE void handle_recv(struct broker *b, struct io_uring_cqe *cqe) {
     c->recv_pending = 0;
 
     // Check state after clearing recv_pending
-    if (c->state != CLIENT_ACTIVE) {
+    if (unlikely(c->state != CLIENT_ACTIVE)) {
         // Client is CLOSING/FREE - don't process data
         return;
     }
 
-    if (cqe->res <= 0) {
+    // Most recvs are successful with data
+    if (unlikely(cqe->res <= 0)) {
         if (cqe->res < 0) {
             log_warn("recv error fd=%d err=%d", fd, cqe->res);
         } else {
@@ -321,7 +364,8 @@ INLINE void handle_recv(struct broker *b, struct io_uring_cqe *cqe) {
 
     process_recv_buffer(b, c);
 
-    if (c->state == CLIENT_ACTIVE) {
+    // Most clients stay active after recv
+    if (likely(c->state == CLIENT_ACTIVE)) {
         submit_recv(b, c);
     }
 }
@@ -346,12 +390,12 @@ INLINE void handle_send_zc(struct broker *b, struct io_uring_cqe *cqe) {
     i32 fd            = (i32)ud_fd(cqe->user_data);
 
     struct send_desc *sd = send_desc_pool_get(&b->send_desc_pool, send_desc_idx);
-    if (!sd) {
+    if (unlikely(!sd)) {
         log_error("handle_send_zc: invalid send_desc_idx %u", send_desc_idx);
         return;
     }
 
-    if (cqe->res < 0) {
+    if (unlikely(cqe->res < 0)) {
         log_debug("zc send error fd=%d err=%d", fd, cqe->res);
         b->msgs_dropped++;
         b->drops_send_failed++;
@@ -361,35 +405,32 @@ INLINE void handle_send_zc(struct broker *b, struct io_uring_cqe *cqe) {
         b->bytes_sent += (u64)cqe->res;
     }
 
-    // Get the canonical message for this send
-    u32 msg_idx = sd->msg_idx;
-    struct canonical_msg *msg = msg_pool_get(&b->msg_pool, msg_idx);
-
-    // Decrement reference count
-    u32 new_ref = msg_pool_unref(&b->msg_pool, msg_idx);
-
-    // If this was the last reference, free the stolen buffer and message
-    if (new_ref == 0 && msg) {
-        if (msg->buf_idx != MSG_POOL_INVALID) {
-            buf_pool_free(&b->recv_pool, msg->buf_idx);
+    // For QoS 0: decrement refcount now (fire and forget, no ACK expected)
+    // For QoS > 0: refcount held until ACK ceremony completes (enables retransmission)
+    if (sd->sub_qos == 0) {
+        u32 msg_idx               = sd->msg_idx;
+        struct canonical_msg *msg = msg_pool_get(&b->msg_pool, msg_idx);
+        u32 new_ref               = msg_pool_unref(&b->msg_pool, msg_idx);
+        if (new_ref == 0 && msg) {
+            if (msg->buf_idx != MSG_POOL_INVALID) {
+                buf_pool_free(&b->recv_pool, msg->buf_idx);
+            }
+            msg_pool_free(&b->msg_pool, msg_idx);
         }
-        msg_pool_free(&b->msg_pool, msg_idx);
     }
 
-    // For QoS > 0, the inflight entry tracks the message for ACK handling
-    // The inflight entry is freed when ACK is received (in handler.h)
-    // Here we just unlink the send_desc from it
-    if (sd->sub_qos > 0) {
+    // For QoS > 0, unlink send_desc from inflight - O(1) using packet_id as index
+    // The inflight entry (and its refcount) is released when ACK ceremony completes
+    if (sd->sub_qos > 0 && sd->packet_id != 0) {
         struct client_slot *c = broker_get_client(b, sd->slot_idx);
         // Check generation to detect slot reuse - if slot was reused,
         // the old inflight entries are gone and we shouldn't touch new client's inflight
         if (c && c->generation == sd->slot_gen) {
-            // Find and unlink the inflight entry
-            for (u16 i = 0; i < c->max_inflight; i++) {
-                if (c->inflight[i].send_desc_idx == send_desc_idx) {
-                    c->inflight[i].send_desc_idx = SEND_DESC_INVALID;
-                    break;
-                }
+            // O(1) lookup: packet_id maps directly to inflight slot
+            u16 inf_idx = (sd->packet_id - 1) % c->max_inflight;
+            if (c->inflight[inf_idx].packet_id == sd->packet_id &&
+                c->inflight[inf_idx].send_desc_idx == send_desc_idx) {
+                c->inflight[inf_idx].send_desc_idx = SEND_DESC_INVALID;
             }
         }
     }
@@ -407,6 +448,11 @@ INLINE void handle_close(struct broker *b, struct io_uring_cqe *cqe) {
     if (c && (c->state == CLIENT_ACTIVE || c->state == CLIENT_CLOSING) && c->fd == fd) {
         i32 slot_idx = b->fd_to_slot[fd];
         log_debug("disconnect fd=%d slot=%d clean=%d", fd, slot_idx, c->clean_session);
+
+        // Release message refs for pending inflight entries before cleanup
+        // These are messages we never got ACKs for
+        release_client_inflight_refs(b, c);
+
         if (c->clean_session) {
             broker_free_slot(b, (u32)slot_idx);
         } else {
@@ -490,14 +536,60 @@ INLINE u32 process_recv_retries(struct broker *b) {
 
 #define ACCEPT_BATCH 32
 
+// =============================================================================
+// Timeout Sweep - cleanup expired inflight entries
+// =============================================================================
+
+// Sweep a single client for expired inflight entries
+// Returns number of entries timed out
+INLINE u32 sweep_client_inflight(struct broker *b, struct client_slot *c, u64 now) {
+    if (c->state != CLIENT_ACTIVE || c->inflight_count == 0) {
+        return 0;
+    }
+
+    u32 timed_out = 0;
+    u16 found     = 0;
+
+    for (u16 i = 0; i < LLMQ_MAX_INFLIGHT && found < c->inflight_count; i++) {
+        struct inflight_msg *inf = &c->inflight[i];
+        if (inf->state == INFLIGHT_FREE) {
+            continue;
+        }
+        found++;
+
+        // Check deadline (0 = no timeout)
+        if (inf->deadline != 0 && now > inf->deadline) {
+            // Entry expired - release message reference (for QoS > 0)
+            // This is the "give up" path - message wasn't ACKed in time
+            release_msg_ref(b, inf->msg_idx);
+            inf->msg_idx       = MSG_POOL_INVALID;
+            inf->send_desc_idx = SEND_DESC_INVALID;
+            inf->state         = INFLIGHT_FREE;
+            c->inflight_count--;
+            timed_out++;
+        }
+    }
+
+    return timed_out;
+}
+
+// Sweep all clients for expired inflight entries
+// Called periodically from event loop
+INLINE u32 broker_sweep_timeouts(struct broker *b) {
+    u32 total_timed_out = 0;
+
+    for (u32 i = 0; i < b->max_clients; i++) {
+        total_timed_out += sweep_client_inflight(b, &b->clients[i], b->now);
+    }
+
+    return total_timed_out;
+}
+
 // Log pool utilization stats
 INLINE void log_pool_stats(struct broker *b) {
     u32 msg_used  = b->msg_pool.capacity - b->msg_pool.free_count;
     u32 sd_used   = b->send_desc_pool.capacity - b->send_desc_pool.free_count;
     u32 recv_used = b->recv_pool.capacity - b->recv_pool.free_count;
-    u32 retry_pending = (b->recv_retry_tail >= b->recv_retry_head)
-                            ? (b->recv_retry_tail - b->recv_retry_head)
-                            : (b->recv_retry_capacity - b->recv_retry_head + b->recv_retry_tail);
 
     // Show dynamic pool info: used/capacity (grows to max)
     // Drop breakdown: if=inflight_full, sd=send_desc_empty, sq=sq_full
@@ -512,6 +604,10 @@ INLINE void log_pool_stats(struct broker *b) {
 INLINE i32 broker_run(struct broker *b) {
     b->running = true;
 
+    // Initialize timing
+    b->now = now_ms();
+    b->last_timeout_sweep = b->now;
+
     // Submit multiple accepts to handle connection bursts
     for (i32 i = 0; i < ACCEPT_BATCH; i++) {
         submit_accept(b);
@@ -523,6 +619,9 @@ INLINE i32 broker_run(struct broker *b) {
     u64 cqe_count       = 0;
 
     while (b->running) {
+        // Update current time (used for deadlines)
+        b->now = now_ms();
+
         // Submit pending SQEs without blocking
         i32 rc = ring_submit(&b->ring, 0);
         if (rc < 0 && rc != -EINTR) {
@@ -542,6 +641,15 @@ INLINE i32 broker_run(struct broker *b) {
 
         process_recv_retries(b);
 
+        // Periodic timeout sweep
+        if (b->now - b->last_timeout_sweep >= LLMQ_TIMEOUT_SWEEP_INTERVAL_MS) {
+            u32 timed_out = broker_sweep_timeouts(b);
+            if (timed_out > 0) {
+                log_debug("Timeout sweep: %u inflight entries expired", timed_out);
+            }
+            b->last_timeout_sweep = b->now;
+        }
+
         // Only block when idle
         if (processed == 0) {
             rc = ring_submit(&b->ring, 1);
@@ -551,7 +659,7 @@ INLINE i32 broker_run(struct broker *b) {
             }
         }
 
-        if (cqe_count - last_stats_time > 50000) {
+        if (cqe_count - last_stats_time > LLMQ_STATS_LOG_INTERVAL) {
             log_pool_stats(b);
             last_stats_time = cqe_count;
         }

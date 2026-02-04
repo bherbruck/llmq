@@ -105,7 +105,8 @@ INLINE u32 trie_find_child(struct topic_trie *t, u32 node_idx, const u8 *seg, u8
         u32 child_idx           = node->children[i];
         struct trie_node *child = &t->nodes[child_idx];
 
-        if (child->name_len == seg_len && memcmp(child->name, seg, seg_len) == 0) {
+        // Length check first (cheap), then memcmp (likely match after length passes)
+        if (child->name_len == seg_len && likely(memcmp(child->name, seg, seg_len) == 0)) {
             return child_idx;
         }
     }
@@ -283,14 +284,14 @@ INLINE void trie_match(struct topic_trie *t, const u8 *topic, u16 len, trie_matc
 
 static void trie_match_recursive(struct topic_trie *t, u32 node_idx, const u8 *topic, u16 pos,
                                  u16 len, trie_match_cb cb, void *ctx) {
-    // Check for '#' wildcard child (matches all remaining)
+    // Check for '#' wildcard child (matches all remaining) - rare in practice
     u32 hash_child = trie_find_hash(t, node_idx);
-    if (hash_child != 0 && t->nodes[hash_child].sub_count > 0) {
+    if (unlikely(hash_child != 0) && t->nodes[hash_child].sub_count > 0) {
         cb(ctx, &t->nodes[hash_child]);
     }
 
     // At end of topic - check for subscribers here
-    if (pos >= len) {
+    if (unlikely(pos >= len)) {
         if (t->nodes[node_idx].sub_count > 0) {
             cb(ctx, &t->nodes[node_idx]);
         }
@@ -301,16 +302,16 @@ static void trie_match_recursive(struct topic_trie *t, u32 node_idx, const u8 *t
     struct mqtt_str seg;
     u16 next_pos = topic_extract_segment(topic, len, pos, &seg);
 
-    // Check '+' wildcard child (matches this segment)
+    // Check '+' wildcard child (matches this segment) - less common than exact match
     u32 plus_child = trie_find_plus(t, node_idx);
-    if (plus_child != 0) {
+    if (unlikely(plus_child != 0)) {
         trie_match_recursive(t, plus_child, topic, next_pos, len, cb, ctx);
     }
 
-    // Check exact match child
-    if (seg.len <= TRIE_MAX_SEGMENT) {
+    // Check exact match child - most common case
+    if (likely(seg.len <= TRIE_MAX_SEGMENT)) {
         u32 exact_child = trie_find_child(t, node_idx, seg.ptr, (u8)seg.len);
-        if (exact_child != 0) {
+        if (likely(exact_child != 0)) {
             trie_match_recursive(t, exact_child, topic, next_pos, len, cb, ctx);
         }
     }
@@ -325,6 +326,8 @@ typedef void (*trie_fd_cb)(void *ctx, u32 fd);
 INLINE void trie_for_each_fd(struct trie_node *node, trie_fd_cb cb, void *ctx) {
     for (u32 slot = 0; slot < TRIE_FD_SLOTS; slot++) {
         u64 bits = node->fd_bitmap[slot];
+        // Most slots are empty - skip quickly
+        if (likely(bits == 0)) continue;
 
         while (bits) {
             u32 bit_idx = (u32)__builtin_ctzll(bits);

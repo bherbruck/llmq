@@ -29,6 +29,7 @@
 #define SYS_exit              60
 #define SYS_fcntl             72
 #define SYS_rt_sigaction      13
+#define SYS_clock_gettime     228
 #define SYS_io_uring_setup    425
 #define SYS_io_uring_enter    426
 #define SYS_io_uring_register 427
@@ -242,6 +243,25 @@ __attribute__((naked)) static void sigreturn_trampoline(void) {
 
 INLINE i32 sys_sigaction(i32 signum, const struct sigaction *act, struct sigaction *oldact) {
     return (i32)syscall4(SYS_rt_sigaction, signum, (i64)act, (i64)oldact, SIGSET_SIZE);
+}
+
+// Clock
+#define CLOCK_MONOTONIC 1
+
+struct timespec {
+    i64 tv_sec;
+    i64 tv_nsec;
+};
+
+INLINE i32 sys_clock_gettime(i32 clock_id, struct timespec *tp) {
+    return (i32)syscall2(SYS_clock_gettime, clock_id, (i64)tp);
+}
+
+// Get monotonic time in milliseconds
+INLINE u64 now_ms(void) {
+    struct timespec ts = {0, 0};
+    sys_clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (u64)ts.tv_sec * 1000 + (u64)ts.tv_nsec / 1000000;
 }
 
 // io_uring syscalls

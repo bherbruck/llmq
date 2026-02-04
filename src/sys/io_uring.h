@@ -15,8 +15,9 @@
 #define IORING_SETUP_SQPOLL        (1U << 1)
 #define IORING_SETUP_SQ_AFF        (1U << 2)
 #define IORING_SETUP_CQSIZE        (1U << 3)
+#define IORING_SETUP_COOP_TASKRUN  (1U << 8)  // Allow task work in any kernel context
 #define IORING_SETUP_SINGLE_ISSUER (1U << 12)
-#define IORING_SETUP_DEFER_TASKRUN (1U << 13)
+#define IORING_SETUP_DEFER_TASKRUN (1U << 13) // Defer task work to io_uring_enter
 
 // Enter flags
 #define IORING_ENTER_GETEVENTS (1U << 0)
@@ -245,7 +246,7 @@ INLINE struct io_uring_sqe *ring_get_sqe(struct ring *r) {
     u32 tail = *r->sq_tail;
     u32 next = tail + 1;
 
-    if (next - head > r->sq_entries) {
+    if (unlikely(next - head > r->sq_entries)) {
         return NULL; // SQ is full
     }
 
@@ -272,14 +273,21 @@ INLINE u32 ring_sq_pending(struct ring *r) {
 }
 
 // Submit pending SQEs and optionally wait for completions
+// With COOP_TASKRUN, completions can be processed opportunistically
+// We still use GETEVENTS to ensure we get completions when waiting
 INLINE i32 ring_submit(struct ring *r, u32 wait_nr) {
     u32 submitted = ring_sq_pending(r);
     if (submitted == 0 && wait_nr == 0) {
-        return 0;
+        return 0; // Nothing to do
     }
-
     u32 flags = wait_nr ? IORING_ENTER_GETEVENTS : 0;
     return sys_io_uring_enter(r->fd, submitted, wait_nr, flags, NULL);
+}
+
+// Submit and wait for at least min_complete CQEs
+INLINE i32 ring_submit_and_wait(struct ring *r, u32 min_complete) {
+    u32 submitted = ring_sq_pending(r);
+    return sys_io_uring_enter(r->fd, submitted, min_complete, IORING_ENTER_GETEVENTS, NULL);
 }
 
 // Peek at next CQE (returns NULL if CQ is empty)
@@ -287,7 +295,7 @@ INLINE struct io_uring_cqe *ring_peek_cqe(struct ring *r) {
     u32 head = *r->cq_head;
     u32 tail = io_uring_smp_load_acquire(r->cq_tail);
 
-    if (head == tail) {
+    if (unlikely(head == tail)) {
         return NULL;
     }
 
