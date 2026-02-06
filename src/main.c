@@ -118,8 +118,9 @@ i32 broker_main(i32 argc, char **argv, char **envp) {
     log_set_level(cfg.debug_log_level);
 
     log_info("llmq - io_uring MQTT broker (zero-copy)");
-    log_info("Config: port=%d max_clients=%d ring=%d", cfg.network_port, cfg.limits_max_conns,
-             cfg.limits_ring_entries);
+    log_info("Config: port=%d max_clients=%d ring=%d egress=%d msg_pool=%d",
+             cfg.network_port, cfg.limits_max_conns, cfg.limits_ring_entries,
+             cfg.client_egress_capacity, cfg.limits_msg_pool_size);
 
     // Initialize broker state
     struct broker b;
@@ -127,7 +128,7 @@ i32 broker_main(i32 argc, char **argv, char **envp) {
 
     // Calculate pool sizes
     u32 msg_pool_size       = cfg.limits_msg_pool_size;
-    u16 egress_capacity     = 256; // Per-client egress ring depth (power of 2)
+    u16 egress_capacity     = cfg.client_egress_capacity;
 
     // mmap client slots and fd mapping (max_fds = 2x clients for headroom)
     rc = broker_init(&b, cfg.limits_max_conns, cfg.limits_max_conns * FD_MULTIPLIER,

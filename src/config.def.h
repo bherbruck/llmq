@@ -26,9 +26,10 @@
     FIELD(limits, max_conns, u32, 4096, "max-conns", "Max connections")          \
     FIELD(limits, max_sessions, u32, 4096, "max-sessions", "Max sessions")       \
     FIELD(limits, ring_entries, u32, 8192, "ring-entries", "io_uring depth")     \
-    FIELD(limits, msg_pool_size, u32, 1024, "msg-pool-size", "Fan-out msg slots")\
+    FIELD(limits, msg_pool_size, u32, 4096, "msg-pool-size", "Fan-out msg slots")\
     /* Per-client buffers */                                                     \
     FIELD(client, max_inflight, u16, 256, "max-inflight", "QoS inflight/client") \
+    FIELD(client, egress_capacity, u16, 2048, "egress-capacity", "Egress ring/client")\
     /* Debug */                                                                  \
     FIELD(debug, log_level, u8, 2, "log-level", "Verbosity 0-4")
 
@@ -66,6 +67,10 @@ INLINE i32 broker_config_parse(i32 argc, char **argv, char **envp, struct broker
     // max_inflight must be power of 2 for fast modulo via bitmask
     if (cfg->client_max_inflight == 0 || cfg->client_max_inflight > LLMQ_MAX_INFLIGHT ||
         (cfg->client_max_inflight & (cfg->client_max_inflight - 1)) != 0)
+        return -1;
+    // egress_capacity must be power of 2, range 64..8192
+    if (cfg->client_egress_capacity < 64 || cfg->client_egress_capacity > 8192 ||
+        (cfg->client_egress_capacity & (cfg->client_egress_capacity - 1)) != 0)
         return -1;
     if (cfg->debug_log_level > LLMQ_MAX_LOG_LEVEL)
         return -1;

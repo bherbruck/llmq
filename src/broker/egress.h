@@ -17,8 +17,8 @@
 #define EGRESS_FLUSH_SUBMITTED 1
 #define EGRESS_FLUSH_SQ_FULL   2
 
-// Max PUBLISH messages batched into a single writev SQE
-#define EGRESS_BATCH_MAX 32
+// Max segments batched into a single writev SQE
+#define EGRESS_BATCH_MAX 64
 
 // Compound egress segment (24 bytes) - one per logical message
 struct egress_segment {
