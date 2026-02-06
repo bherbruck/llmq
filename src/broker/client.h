@@ -126,29 +126,32 @@ struct client_slot {
     // === Session (persists when DORMANT if clean_session=0) ===
     // Subscriptions tracked in trie via slot index
 
-    // Pending messages for offline delivery (small, kept inline)
-    struct pending_msg pending[LLMQ_MAX_PENDING_MSGS];
+    // Pending messages for offline delivery (arena-allocated, not embedded)
+    struct pending_msg *pending;
     u8 pending_head;
     u8 pending_tail;
     u8 pending_count;
     u8 _pad2;
 
     // === QoS 1/2 Inflight tracking (hot/cold split for cache efficiency) ===
+    // Arrays are arena-allocated (not embedded) to keep client_slot compact for cache.
+    // At 1000 clients, embedded 68KB structs = 68MB working set (exceeds L3).
+    // With pointers, client_slot is ~1.2KB → 1000 clients = 1.2MB (fits in L3).
     u16 next_packet_id;                               // Next packet ID to allocate (wraps at 65535)
     u16 inflight_count;                               // Active inflight messages
     u16 max_inflight;                                 // Runtime limit for this client (must be power of 2)
     u16 inflight_mask;                                // max_inflight - 1 for fast modulo via &
     u16 inflight_free_hint;                           // Hint for next free slot (O(1) alloc)
     u16 inflight_generation;                          // Generation counter for packet_id cycling
-    struct inflight_hot inflight_hot[LLMQ_MAX_INFLIGHT];   // Hot: packet_id, state, msg_idx (8B each)
-    struct inflight_cold inflight_cold[LLMQ_MAX_INFLIGHT]; // Cold: deadline, qos, etc (24B each)
+    u16 inflight_hash_mask;                           // Hash table mask (2 * max_inflight - 1)
+    u16 _pad3;
+    struct inflight_hot *inflight_hot;                // Hot: packet_id, state, msg_idx (8B each)
+    struct inflight_cold *inflight_cold;              // Cold: deadline, qos, etc (24B each)
 
     // Packet ID hash table for O(1) lookup (packet_id → inflight slot)
     // Size 2x max_inflight for good load factor with linear probing
-    #define INFLIGHT_HASH_SIZE 512
-    #define INFLIGHT_HASH_MASK (INFLIGHT_HASH_SIZE - 1)
     #define INFLIGHT_HASH_EMPTY 0xFFFF
-    u16 inflight_pkt_hash[INFLIGHT_HASH_SIZE];       // packet_id hash → slot_idx
+    u16 *inflight_pkt_hash;                           // packet_id hash → slot_idx
 };
 
 // =============================================================================
@@ -198,15 +201,16 @@ INLINE void client_init(struct client_slot *c, i32 fd, u32 recv_buf_idx, u16 max
     c->inflight_mask        = max_inflight - 1;  // For fast modulo via &
     c->inflight_free_hint   = 0;
     c->inflight_generation  = 0;
+    c->inflight_hash_mask   = 2 * max_inflight - 1;
     // Fast init: memset arrays to 0xFF (sets msg_idx/send_desc_idx to INVALID)
     // Then fix up state field which needs to be 0 (INFLIGHT_FREE)
-    memset(c->inflight_hot, 0xFF, sizeof(c->inflight_hot));
-    memset(c->inflight_cold, 0xFF, sizeof(c->inflight_cold));
-    for (u16 i = 0; i < LLMQ_MAX_INFLIGHT; i++) {
+    memset(c->inflight_hot, 0xFF, (usize)max_inflight * sizeof(struct inflight_hot));
+    memset(c->inflight_cold, 0xFF, (usize)max_inflight * sizeof(struct inflight_cold));
+    for (u16 i = 0; i < max_inflight; i++) {
         c->inflight_hot[i].state = INFLIGHT_FREE;
     }
     // Initialize hash table with memset (INFLIGHT_HASH_EMPTY = 0xFFFF = all 1s)
-    memset(c->inflight_pkt_hash, 0xFF, sizeof(c->inflight_pkt_hash));
+    memset(c->inflight_pkt_hash, 0xFF, (usize)(2 * max_inflight) * sizeof(u16));
 }
 
 // Get receive buffer pointer (requires pool reference)
@@ -346,14 +350,14 @@ INLINE void client_pending_pop(struct client_slot *c) {
 
 // Insert packet_id → slot mapping into hash table
 INLINE void inflight_hash_insert(struct client_slot *c, u16 packet_id, u16 slot) {
-    u32 idx = packet_id & INFLIGHT_HASH_MASK;
+    u32 idx = packet_id & c->inflight_hash_mask;
     // Linear probing
-    for (u32 probe = 0; probe < INFLIGHT_HASH_SIZE; probe++) {
+    for (u32 probe = 0; probe < (c->inflight_hash_mask + 1); probe++) {
         if (c->inflight_pkt_hash[idx] == INFLIGHT_HASH_EMPTY) {
             c->inflight_pkt_hash[idx] = slot;
             return;
         }
-        idx = (idx + 1) & INFLIGHT_HASH_MASK;
+        idx = (idx + 1) & c->inflight_hash_mask;
     }
     // Table full - shouldn't happen if sized correctly (2x max_inflight)
 }
@@ -362,9 +366,9 @@ INLINE void inflight_hash_insert(struct client_slot *c, u16 packet_id, u16 slot)
 // Simple EMPTY marking would break linear probing chains; instead we
 // shift subsequent entries back to fill the gap, preserving probe order.
 INLINE void inflight_hash_remove(struct client_slot *c, u16 packet_id) {
-    u32 idx = packet_id & INFLIGHT_HASH_MASK;
+    u32 idx = packet_id & c->inflight_hash_mask;
     // Find the entry
-    for (u32 probe = 0; probe < INFLIGHT_HASH_SIZE; probe++) {
+    for (u32 probe = 0; probe < (c->inflight_hash_mask + 1); probe++) {
         u16 slot = c->inflight_pkt_hash[idx];
         if (slot == INFLIGHT_HASH_EMPTY) {
             return; // Not found
@@ -375,12 +379,12 @@ INLINE void inflight_hash_remove(struct client_slot *c, u16 packet_id) {
             u32 empty = idx;
             u32 j = idx;
             for (;;) {
-                j = (j + 1) & INFLIGHT_HASH_MASK;
+                j = (j + 1) & c->inflight_hash_mask;
                 u16 j_slot = c->inflight_pkt_hash[j];
                 if (j_slot == INFLIGHT_HASH_EMPTY) {
                     break; // End of cluster
                 }
-                u32 natural = c->inflight_hot[j_slot].packet_id & INFLIGHT_HASH_MASK;
+                u32 natural = c->inflight_hot[j_slot].packet_id & c->inflight_hash_mask;
                 // Shift if natural position is at or before the gap (with wraparound)
                 bool should_shift = (j > empty)
                     ? (natural <= empty || natural > j)
@@ -393,7 +397,7 @@ INLINE void inflight_hash_remove(struct client_slot *c, u16 packet_id) {
             c->inflight_pkt_hash[empty] = INFLIGHT_HASH_EMPTY;
             return;
         }
-        idx = (idx + 1) & INFLIGHT_HASH_MASK;
+        idx = (idx + 1) & c->inflight_hash_mask;
     }
 }
 
@@ -549,8 +553,8 @@ INLINE i32 client_inflight_find(struct client_slot *c, u16 packet_id) {
     }
 
     // Slow path: hash table for incoming messages with arbitrary packet_ids
-    u32 idx = packet_id & INFLIGHT_HASH_MASK;
-    for (u32 probe = 0; probe < INFLIGHT_HASH_SIZE; probe++) {
+    u32 idx = packet_id & c->inflight_hash_mask;
+    for (u32 probe = 0; probe < (c->inflight_hash_mask + 1); probe++) {
         slot = c->inflight_pkt_hash[idx];
         if (slot == INFLIGHT_HASH_EMPTY) {
             return -1;
@@ -560,7 +564,7 @@ INLINE i32 client_inflight_find(struct client_slot *c, u16 packet_id) {
             c->inflight_hot[slot].packet_id == packet_id) {
             return (i32)slot;
         }
-        idx = (idx + 1) & INFLIGHT_HASH_MASK;
+        idx = (idx + 1) & c->inflight_hash_mask;
     }
     return -1;
 }
@@ -591,16 +595,16 @@ INLINE void client_inflight_free_all(struct client_slot *c) {
     }
 
     // Fast reset: memset to 0xFF then fix state fields
-    memset(c->inflight_hot, 0xFF, sizeof(c->inflight_hot));
-    memset(c->inflight_cold, 0xFF, sizeof(c->inflight_cold));
-    for (u16 i = 0; i < LLMQ_MAX_INFLIGHT; i++) {
+    memset(c->inflight_hot, 0xFF, (usize)c->max_inflight * sizeof(struct inflight_hot));
+    memset(c->inflight_cold, 0xFF, (usize)c->max_inflight * sizeof(struct inflight_cold));
+    for (u16 i = 0; i < c->max_inflight; i++) {
         c->inflight_hot[i].state = INFLIGHT_FREE;
     }
     c->inflight_count     = 0;
     c->inflight_free_hint = 0;
 
     // Clear hash table with memset
-    memset(c->inflight_pkt_hash, 0xFF, sizeof(c->inflight_pkt_hash));
+    memset(c->inflight_pkt_hash, 0xFF, (usize)(c->inflight_hash_mask + 1) * sizeof(u16));
 }
 
 #endif // BROKER_CLIENT_H

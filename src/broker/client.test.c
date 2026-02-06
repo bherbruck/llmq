@@ -3,12 +3,29 @@
 #include "test/test.h"
 #include "broker/client.h"
 
+// Test backing arrays (client_slot no longer embeds these)
+static struct inflight_hot test_hot[LLMQ_MAX_INFLIGHT];
+static struct inflight_cold test_cold[LLMQ_MAX_INFLIGHT];
+static u16 test_hash[LLMQ_MAX_INFLIGHT * 2];
+static struct pending_msg test_pending[LLMQ_MAX_PENDING_MSGS];
+
+static void test_client_wire(struct client_slot *c) {
+    c->inflight_hot      = test_hot;
+    c->inflight_cold     = test_cold;
+    c->inflight_pkt_hash = test_hash;
+    c->pending           = test_pending;
+}
+
+// Hash size for collision tests (2x max_inflight, same as broker_init)
+#define TEST_HASH_SIZE (2 * LLMQ_MAX_INFLIGHT)
+
 // =============================================================================
 // Inflight Allocation Tests
 // =============================================================================
 
 TEST(inflight_alloc_qos1) {
     struct client_slot c;
+    test_client_wire(&c);
     client_init(&c, 10, BUF_POOL_INVALID, LLMQ_MAX_INFLIGHT);
 
     u16 packet_id;
@@ -27,6 +44,7 @@ TEST(inflight_alloc_qos1) {
 
 TEST(inflight_alloc_qos2) {
     struct client_slot c;
+    test_client_wire(&c);
     client_init(&c, 10, BUF_POOL_INVALID, LLMQ_MAX_INFLIGHT);
 
     u16 packet_id;
@@ -43,6 +61,7 @@ TEST(inflight_alloc_qos2) {
 
 TEST(inflight_alloc_unique_packet_ids) {
     struct client_slot c;
+    test_client_wire(&c);
     client_init(&c, 10, BUF_POOL_INVALID, LLMQ_MAX_INFLIGHT);
 
     u16 ids[LLMQ_MAX_INFLIGHT];
@@ -63,6 +82,7 @@ TEST(inflight_alloc_unique_packet_ids) {
 
 TEST(inflight_alloc_full) {
     struct client_slot c;
+    test_client_wire(&c);
     client_init(&c, 10, BUF_POOL_INVALID, LLMQ_MAX_INFLIGHT);
 
     // Fill up inflight slots
@@ -86,6 +106,7 @@ TEST(inflight_alloc_full) {
 
 TEST(inflight_find) {
     struct client_slot c;
+    test_client_wire(&c);
     client_init(&c, 10, BUF_POOL_INVALID, LLMQ_MAX_INFLIGHT);
 
     u16 packet_id;
@@ -104,6 +125,7 @@ TEST(inflight_find) {
 
 TEST(inflight_free) {
     struct client_slot c;
+    test_client_wire(&c);
     client_init(&c, 10, BUF_POOL_INVALID, LLMQ_MAX_INFLIGHT);
 
     u16 packet_id;
@@ -123,6 +145,7 @@ TEST(inflight_free) {
 
 TEST(inflight_reuse_after_free) {
     struct client_slot c;
+    test_client_wire(&c);
     client_init(&c, 10, BUF_POOL_INVALID, LLMQ_MAX_INFLIGHT);
 
     // Allocate and free
@@ -146,6 +169,7 @@ TEST(inflight_reuse_after_free) {
 
 TEST(inflight_track_incoming) {
     struct client_slot c;
+    test_client_wire(&c);
     client_init(&c, 10, BUF_POOL_INVALID, LLMQ_MAX_INFLIGHT);
 
     i32 idx = client_inflight_track_incoming(&c, 42, 0);
@@ -162,6 +186,7 @@ TEST(inflight_track_incoming) {
 
 TEST(inflight_track_incoming_duplicate) {
     struct client_slot c;
+    test_client_wire(&c);
     client_init(&c, 10, BUF_POOL_INVALID, LLMQ_MAX_INFLIGHT);
 
     // Track same packet ID twice (simulating DUP PUBLISH)
@@ -181,6 +206,7 @@ TEST(inflight_track_incoming_duplicate) {
 
 TEST(qos1_state_transition) {
     struct client_slot c;
+    test_client_wire(&c);
     client_init(&c, 10, BUF_POOL_INVALID, LLMQ_MAX_INFLIGHT);
 
     // Allocate QoS 1 - starts in WAIT_PUBACK
@@ -197,6 +223,7 @@ TEST(qos1_state_transition) {
 
 TEST(qos2_outgoing_state_transitions) {
     struct client_slot c;
+    test_client_wire(&c);
     client_init(&c, 10, BUF_POOL_INVALID, LLMQ_MAX_INFLIGHT);
 
     // Allocate QoS 2 outgoing - starts in WAIT_PUBREC
@@ -217,6 +244,7 @@ TEST(qos2_outgoing_state_transitions) {
 
 TEST(qos2_incoming_state_transitions) {
     struct client_slot c;
+    test_client_wire(&c);
     client_init(&c, 10, BUF_POOL_INVALID, LLMQ_MAX_INFLIGHT);
 
     // Track incoming QoS 2 - starts in WAIT_PUBREL
@@ -237,12 +265,13 @@ TEST(qos2_incoming_state_transitions) {
 
 TEST(inflight_hash_remove_preserves_chain) {
     struct client_slot c;
+    test_client_wire(&c);
     client_init(&c, 10, BUF_POOL_INVALID, LLMQ_MAX_INFLIGHT);
 
     // Insert two incoming QoS 2 messages that hash to the same bucket.
     // INFLIGHT_HASH_MASK = 511, so packet_ids that differ by 512 collide.
     u16 id_a = 100;
-    u16 id_b = 100 + INFLIGHT_HASH_SIZE; // Same hash bucket as id_a
+    u16 id_b = 100 + TEST_HASH_SIZE; // Same hash bucket as id_a
 
     i32 slot_a = client_inflight_track_incoming(&c, id_a, 0);
     i32 slot_b = client_inflight_track_incoming(&c, id_b, 0);
@@ -268,12 +297,13 @@ TEST(inflight_hash_remove_preserves_chain) {
 
 TEST(inflight_hash_remove_triple_collision) {
     struct client_slot c;
+    test_client_wire(&c);
     client_init(&c, 10, BUF_POOL_INVALID, LLMQ_MAX_INFLIGHT);
 
     // Three colliding packet_ids
     u16 id_a = 50;
-    u16 id_b = 50 + INFLIGHT_HASH_SIZE;
-    u16 id_c = 50 + INFLIGHT_HASH_SIZE * 2;
+    u16 id_b = 50 + TEST_HASH_SIZE;
+    u16 id_c = 50 + TEST_HASH_SIZE * 2;
 
     i32 slot_a = client_inflight_track_incoming(&c, id_a, 0);
     i32 slot_b = client_inflight_track_incoming(&c, id_b, 0);

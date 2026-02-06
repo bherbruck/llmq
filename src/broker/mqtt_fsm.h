@@ -158,12 +158,11 @@ INLINE void fsm_sub_puback_received(struct broker *b, struct client_slot *sub,
         return; // Unexpected or duplicate - ignore
     }
 
-    // Free send_desc if still linked (CQE_SKIP_SUCCESS: send CQE was skipped)
-    if (sub->inflight_cold[slot].send_desc_idx != SEND_DESC_INVALID) {
-        send_desc_pool_free(&b->send_desc_pool, sub->inflight_cold[slot].send_desc_idx);
+    // Ceremony complete - free send_desc (if still held) and release reference
+    u32 sd_idx = sub->inflight_cold[slot].send_desc_idx;
+    if (sd_idx != SEND_DESC_INVALID) {
+        send_desc_pool_free(&b->send_desc_pool, sd_idx);
     }
-
-    // Ceremony complete - release reference
     release_msg_ref(b, sub->inflight_hot[slot].msg_idx);
     client_inflight_free_slot(sub, (u16)slot);
 }
@@ -178,12 +177,22 @@ INLINE void fsm_sub_pubrec_received(struct broker *b, struct client_slot *sub,
         return; // Unexpected - ignore
     }
 
+    // Free send_desc from initial PUBLISH (no longer needed after PUBREC)
+    u32 sd_idx = sub->inflight_cold[slot].send_desc_idx;
+    if (sd_idx != SEND_DESC_INVALID) {
+        send_desc_pool_free(&b->send_desc_pool, sd_idx);
+        sub->inflight_cold[slot].send_desc_idx = SEND_DESC_INVALID;
+    }
+
     // Transition state (hot write + cold write)
     sub->inflight_hot[slot].state    = INFLIGHT_WAIT_PUBCOMP;
     sub->inflight_cold[slot].deadline = b->now + LLMQ_INFLIGHT_TIMEOUT_MS;
 
     // Send PUBREL async (hot path - 1000s of these per message)
-    submit_send_inf(b, sub, (u16)slot, HDR_PUBREL);
+    // Fall back to resp_buf path if SQ full (avoids waiting for timeout sweep)
+    if (!submit_send_inf(b, sub, (u16)slot, HDR_PUBREL)) {
+        send_pubrel(b, sub, packet_id);
+    }
 }
 
 // Called when we receive PUBCOMP from subscriber (QoS 2 complete).
@@ -196,12 +205,11 @@ INLINE void fsm_sub_pubcomp_received(struct broker *b, struct client_slot *sub,
         return; // Unexpected - ignore
     }
 
-    // Free send_desc if still linked (CQE_SKIP_SUCCESS: send CQE was skipped)
-    if (sub->inflight_cold[slot].send_desc_idx != SEND_DESC_INVALID) {
-        send_desc_pool_free(&b->send_desc_pool, sub->inflight_cold[slot].send_desc_idx);
+    // Ceremony complete - free send_desc (if still held) and release reference
+    u32 sd_idx = sub->inflight_cold[slot].send_desc_idx;
+    if (sd_idx != SEND_DESC_INVALID) {
+        send_desc_pool_free(&b->send_desc_pool, sd_idx);
     }
-
-    // Ceremony complete - release reference
     release_msg_ref(b, sub->inflight_hot[slot].msg_idx);
     client_inflight_free_slot(sub, (u16)slot);
 }
@@ -219,11 +227,10 @@ INLINE void fsm_sub_timeout(struct broker *b, struct client_slot *sub,
 
     // Check if we should give up
     if (cold->dup_count >= LLMQ_MAX_RETRIES) {
-        // Free send_desc if still linked (CQE_SKIP_SUCCESS: send CQE was skipped)
+        // Max retries reached - free send_desc if still held, give up
         if (cold->send_desc_idx != SEND_DESC_INVALID) {
             send_desc_pool_free(&b->send_desc_pool, cold->send_desc_idx);
         }
-        // Max retries reached - give up
         release_msg_ref(b, hot->msg_idx);
         client_inflight_free_slot(sub, inf_slot);
         b->msgs_dropped++;
@@ -236,11 +243,12 @@ INLINE void fsm_sub_timeout(struct broker *b, struct client_slot *sub,
 
     if (hot->state == INFLIGHT_WAIT_PUBCOMP) {
         // QoS 2: Already received PUBREC, retransmit PUBREL (not PUBLISH)
+        // send_desc from PUBLISH was freed in pubrec_received
         send_pubrel(b, sub, hot->packet_id);
         return;
     }
 
-    // Free old send_desc before retransmit (CQE_SKIP_SUCCESS: send CQE was skipped)
+    // Free old send_desc before creating new one for retransmit
     if (cold->send_desc_idx != SEND_DESC_INVALID) {
         send_desc_pool_free(&b->send_desc_pool, cold->send_desc_idx);
         cold->send_desc_idx = SEND_DESC_INVALID;
@@ -267,7 +275,7 @@ INLINE void fsm_sub_timeout(struct broker *b, struct client_slot *sub,
 // =============================================================================
 
 // Called when a client disconnects.
-// Releases message references and send_descs for all pending outgoing inflight entries.
+// Releases message references for all pending outgoing inflight entries.
 // Note: caller (broker_free_slot) handles client_inflight_free_all
 INLINE void fsm_client_disconnect(struct broker *b, struct client_slot *c) {
     if (c->inflight_count == 0) {
@@ -284,18 +292,13 @@ INLINE void fsm_client_disconnect(struct broker *b, struct client_slot *c) {
 
         // Only release refs for outgoing messages (direction=0)
         // Incoming QoS 2 tracking (direction=1) doesn't hold buffer refs
-        if (hot->direction == 0) {
-            // Free send_desc if still linked (CQE_SKIP_SUCCESS: send CQE was skipped).
-            // Safe because alloc_gen check in handle_send_zc prevents stale error CQEs
-            // from freeing a reused send_desc.
+        if (hot->direction == 0 && hot->msg_idx != MSG_POOL_INVALID) {
+            // Free send_desc if still held (CQE_SKIP: no success CQE to free it)
             struct inflight_cold *cold = &c->inflight_cold[i];
             if (cold->send_desc_idx != SEND_DESC_INVALID) {
                 send_desc_pool_free(&b->send_desc_pool, cold->send_desc_idx);
-                cold->send_desc_idx = SEND_DESC_INVALID;
             }
-            if (hot->msg_idx != MSG_POOL_INVALID) {
-                release_msg_ref(b, hot->msg_idx);
-            }
+            release_msg_ref(b, hot->msg_idx);
         }
     }
     // Note: inflight entries freed by broker_free_slot calling client_inflight_free_all

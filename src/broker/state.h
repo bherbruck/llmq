@@ -29,8 +29,16 @@ struct broker {
     u16 port;
     u16 max_inflight; // Runtime limit for inflight messages per client
 
-    // Client slots (mmap'd)
+    // Client slots (mmap'd, compact ~1.2KB each)
     struct client_slot *clients;
+
+    // Client data arenas (large arrays allocated separately for cache locality)
+    // With embedded arrays, client_slot was ~68KB → 1000 clients = 68MB (exceeds L3).
+    // With arenas, client_slot is ~1.2KB → 1000 clients = 1.2MB (fits in L3).
+    struct inflight_hot *inflight_hot_arena;
+    struct inflight_cold *inflight_cold_arena;
+    u16 *inflight_hash_arena;
+    struct pending_msg *pending_arena;
 
     // Recv retry queue (for SQ-full recovery)
     // Circular buffer of slot indices that need recv resubmission
@@ -153,7 +161,7 @@ INLINE i32 broker_init(struct broker *b, u32 max_clients, u32 max_fds, u16 max_i
         return -1;
     }
 
-    // mmap client slots (now much smaller without embedded buffers)
+    // mmap client slots (compact - large arrays stored in arenas)
     usize clients_size = max_clients * sizeof(struct client_slot);
     b->clients         = (struct client_slot *)sys_mmap(NULL, clients_size, PROT_READ | PROT_WRITE,
                                                         MAP_PRIVATE | MAP_ANON, -1, 0);
@@ -166,11 +174,55 @@ INLINE i32 broker_init(struct broker *b, u32 max_clients, u32 max_fds, u16 max_i
         return -1;
     }
 
+    // mmap client data arenas (inflight + pending arrays, separate for cache locality)
+    u32 hash_size = 2 * (u32)max_inflight;
+    usize hot_arena_size  = (usize)max_clients * max_inflight * sizeof(struct inflight_hot);
+    usize cold_arena_size = (usize)max_clients * max_inflight * sizeof(struct inflight_cold);
+    usize hash_arena_size = (usize)max_clients * hash_size * sizeof(u16);
+    usize pend_arena_size = (usize)max_clients * LLMQ_MAX_PENDING_MSGS * sizeof(struct pending_msg);
+
+    b->inflight_hot_arena = (struct inflight_hot *)sys_mmap(
+        NULL, hot_arena_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    b->inflight_cold_arena = (struct inflight_cold *)sys_mmap(
+        NULL, cold_arena_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    b->inflight_hash_arena = (u16 *)sys_mmap(
+        NULL, hash_arena_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    b->pending_arena = (struct pending_msg *)sys_mmap(
+        NULL, pend_arena_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+
+    if (IS_ERR(b->inflight_hot_arena) || IS_ERR(b->inflight_cold_arena) ||
+        IS_ERR(b->inflight_hash_arena) || IS_ERR(b->pending_arena)) {
+        // Cleanup on failure (IS_ERR pointers are negative, won't match real ptrs)
+        if (!IS_ERR(b->inflight_hot_arena))  sys_munmap(b->inflight_hot_arena, hot_arena_size);
+        if (!IS_ERR(b->inflight_cold_arena)) sys_munmap(b->inflight_cold_arena, cold_arena_size);
+        if (!IS_ERR(b->inflight_hash_arena)) sys_munmap(b->inflight_hash_arena, hash_arena_size);
+        if (!IS_ERR(b->pending_arena))       sys_munmap(b->pending_arena, pend_arena_size);
+        sys_munmap(b->clients, clients_size);
+        send_desc_pool_cleanup(&b->send_desc_pool);
+        msg_pool_cleanup(&b->msg_pool);
+        buf_pool_cleanup(&b->recv_pool);
+        sys_munmap(b->send_retry_queue, b->send_retry_capacity * sizeof(u64));
+        sys_munmap(b->recv_retry_queue, b->recv_retry_capacity * sizeof(u32));
+        return -1;
+    }
+
+    // Wire up per-client pointers into arenas
+    for (u32 i = 0; i < max_clients; i++) {
+        b->clients[i].inflight_hot      = &b->inflight_hot_arena[(usize)i * max_inflight];
+        b->clients[i].inflight_cold     = &b->inflight_cold_arena[(usize)i * max_inflight];
+        b->clients[i].inflight_pkt_hash = &b->inflight_hash_arena[(usize)i * hash_size];
+        b->clients[i].pending           = &b->pending_arena[(usize)i * LLMQ_MAX_PENDING_MSGS];
+    }
+
     // mmap fd_to_slot mapping
     usize fd_map_size = max_fds * sizeof(i32);
     b->fd_to_slot =
         (i32 *)sys_mmap(NULL, fd_map_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
     if (IS_ERR(b->fd_to_slot)) {
+        sys_munmap(b->inflight_hot_arena, hot_arena_size);
+        sys_munmap(b->inflight_cold_arena, cold_arena_size);
+        sys_munmap(b->inflight_hash_arena, hash_arena_size);
+        sys_munmap(b->pending_arena, pend_arena_size);
         sys_munmap(b->clients, clients_size);
         send_desc_pool_cleanup(&b->send_desc_pool);
         msg_pool_cleanup(&b->msg_pool);
@@ -203,6 +255,10 @@ INLINE i32 broker_init(struct broker *b, u32 max_clients, u32 max_fds, u16 max_i
     // Initialize client_id hash table (sized for 2x max_clients for low load factor)
     if (hashmap_init(&b->client_map, max_clients * 2) < 0) {
         sys_munmap(b->fd_to_slot, fd_map_size);
+        sys_munmap(b->inflight_hot_arena, hot_arena_size);
+        sys_munmap(b->inflight_cold_arena, cold_arena_size);
+        sys_munmap(b->inflight_hash_arena, hash_arena_size);
+        sys_munmap(b->pending_arena, pend_arena_size);
         sys_munmap(b->clients, clients_size);
         sys_munmap(b->send_retry_queue, b->send_retry_capacity * sizeof(u64));
         sys_munmap(b->recv_retry_queue, b->recv_retry_capacity * sizeof(u32));
@@ -229,6 +285,24 @@ INLINE void broker_cleanup(struct broker *b) {
         }
     }
 
+    // Free client data arenas
+    u32 hash_sz = 2 * (u32)b->max_inflight;
+    if (b->inflight_hot_arena) {
+        sys_munmap(b->inflight_hot_arena,
+                   (usize)b->max_clients * b->max_inflight * sizeof(struct inflight_hot));
+    }
+    if (b->inflight_cold_arena) {
+        sys_munmap(b->inflight_cold_arena,
+                   (usize)b->max_clients * b->max_inflight * sizeof(struct inflight_cold));
+    }
+    if (b->inflight_hash_arena) {
+        sys_munmap(b->inflight_hash_arena,
+                   (usize)b->max_clients * hash_sz * sizeof(u16));
+    }
+    if (b->pending_arena) {
+        sys_munmap(b->pending_arena,
+                   (usize)b->max_clients * LLMQ_MAX_PENDING_MSGS * sizeof(struct pending_msg));
+    }
     if (b->clients) {
         sys_munmap(b->clients, b->max_clients * sizeof(struct client_slot));
     }
