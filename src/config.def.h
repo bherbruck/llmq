@@ -27,8 +27,6 @@
     FIELD(limits, max_sessions, u32, 4096, "max-sessions", "Max sessions")       \
     FIELD(limits, ring_entries, u32, 8192, "ring-entries", "io_uring depth")     \
     FIELD(limits, msg_pool_size, u32, 1024, "msg-pool-size", "Fan-out msg slots")\
-    FIELD(limits, send_desc_mult, u8, 16, "send-desc-mult", "Send descs per conn")\
-    FIELD(limits, send_desc_max_mb, u32, 1536, "send-desc-max", "Max send_desc MB")\
     /* Per-client buffers */                                                     \
     FIELD(client, max_inflight, u16, 256, "max-inflight", "QoS inflight/client") \
     /* Debug */                                                                  \

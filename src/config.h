@@ -42,10 +42,6 @@
 #define LLMQ_MAX_INFLIGHT 1024 // Max capacity for inflight array (runtime can use less)
 #endif
 
-#ifndef LLMQ_SEND_BUF_SIZE
-#define LLMQ_SEND_BUF_SIZE 4096 // 4KB per-inflight send buffer
-#endif
-
 #ifndef LLMQ_PENDING_MSG_DATA
 #define LLMQ_PENDING_MSG_DATA 1024 // 1KB per pending message (offline queue)
 #endif

@@ -9,6 +9,7 @@
 
 #include "broker/state.h"
 #include "broker/client.h"
+#include "broker/egress.h"
 #include "broker/msg_path.h"
 #include "config.h"
 
@@ -32,6 +33,9 @@ INLINE void send_pubcomp(struct broker *b, struct client_slot *c, u16 packet_id)
 
 // Message reference release (defined in loop.h)
 INLINE void release_msg_ref(struct broker *b, u32 msg_idx);
+
+// Egress flush (defined in loop.h)
+INLINE u8 egress_flush(struct broker *b, struct client_slot *c, u32 slot_idx);
 
 // =============================================================================
 // Publisher Ceremony (we receive PUBLISH from them)
@@ -104,47 +108,64 @@ INLINE void fsm_pub_pubrel_received(struct broker *b, struct client_slot *pub,
 INLINE i32 fsm_sub_start_delivery(struct broker *b, struct client_slot *sub,
                                    u32 msg_idx, u8 sub_qos, u32 slot_idx) {
     // Take reference for this subscriber (all QoS levels)
-    // QoS 0: released on send completion
-    // QoS 1/2: released on ACK ceremony completion
     msg_ref(b, msg_idx);
+    u8 retain = 0;
+    struct canonical_msg *msg = msg_pool_get(&b->msg_pool, msg_idx);
+    if (msg) {
+        retain = msg->retain;
+    }
 
     if (sub_qos == 0) {
-        // QoS 0: fire and forget, no tracking needed
-        i32 sd_idx = msg_prepare_send(b, msg_idx, 0, 0, 0, slot_idx, sub->generation);
-        if (unlikely(sd_idx < 0)) {
+        // QoS 0: enqueue segment, ref released on send completion
+        if (egress_full(sub->egress_count, sub->egress_capacity)) {
             release_msg_ref(b, msg_idx);
+            b->drops_egress_full++;
             return -1;
         }
-        msg_submit(b, (u32)sd_idx, sub->fd);
+        struct egress_segment *seg = egress_push(sub->egress, sub->egress_head,
+                                                  sub->egress_count, sub->egress_mask);
+        seg->msg_idx   = msg_idx;
+        seg->packet_id = 0;
+        seg->kind      = SEG_PUBLISH;
+        seg->qos       = 0;
+        seg->dup       = 0;
+        seg->retain    = retain;
+        seg->slot_gen  = sub->generation;
+        seg->ctrl_len  = 0;
+        seg->cursor    = 0;
+        if (msg) egress_seg_store_wire_len(seg, egress_publish_wire_len(msg, 0));
+        sub->egress_count++;
+        if (egress_flush(b, sub, slot_idx) == EGRESS_FLUSH_SQ_FULL) {
+            egress_flush_enqueue(b, slot_idx);
+        }
         return 0;
     }
 
-    // QoS 1/2: allocate inflight entry
-    u16 packet_id;
-    u64 deadline = b->now + LLMQ_INFLIGHT_TIMEOUT_MS;
-    i32 inf_idx  = client_inflight_alloc(sub, sub_qos, msg_idx, deadline, &packet_id);
-    if (unlikely(inf_idx < 0)) {
-        // Client inflight full - backpressure
+    // QoS 1/2: enqueue in egress. Inflight allocated at flush time (deferred).
+    // This prevents inflight saturation when egress queue is deep —
+    // slots are only consumed for messages actually submitted to the kernel.
+    if (egress_full(sub->egress_count, sub->egress_capacity)) {
         release_msg_ref(b, msg_idx);
-        b->drops_inflight_full++;
+        b->drops_egress_full++;
         return -1;
     }
 
-    // Prepare send descriptor
-    i32 sd_idx = msg_prepare_send(b, msg_idx, packet_id, sub_qos, 0, slot_idx, sub->generation);
-    if (unlikely(sd_idx < 0)) {
-        // Failed to prepare - clean up
-        release_msg_ref(b, msg_idx);
-        client_inflight_free_slot(sub, (u16)inf_idx);
-        b->drops_send_desc_empty++;
-        return -1;
+    struct egress_segment *seg = egress_push(sub->egress, sub->egress_head,
+                                              sub->egress_count, sub->egress_mask);
+    seg->msg_idx   = msg_idx;
+    seg->packet_id = 0;  // Assigned at flush time when inflight is allocated
+    seg->kind      = SEG_PUBLISH;
+    seg->qos       = sub_qos;
+    seg->dup       = 0;
+    seg->retain    = retain;
+    seg->slot_gen  = sub->generation;
+    seg->ctrl_len  = 0;
+    seg->cursor    = 0;
+    if (msg) egress_seg_store_wire_len(seg, egress_publish_wire_len(msg, sub_qos));
+    sub->egress_count++;
+    if (egress_flush(b, sub, slot_idx) == EGRESS_FLUSH_SQ_FULL) {
+        egress_flush_enqueue(b, slot_idx);
     }
-
-    // Link send_desc to inflight for completion handling
-    sub->inflight_cold[inf_idx].send_desc_idx = (u32)sd_idx;
-
-    // Submit to io_uring
-    msg_submit(b, (u32)sd_idx, sub->fd);
     return 0;
 }
 
@@ -152,66 +173,62 @@ INLINE i32 fsm_sub_start_delivery(struct broker *b, struct client_slot *sub,
 // Releases message reference and frees inflight entry.
 INLINE void fsm_sub_puback_received(struct broker *b, struct client_slot *sub,
                                     u16 packet_id) {
-    // Direct lookup - we assigned this packet_id, no hash table needed
     i32 slot = client_inflight_find_direct(sub, packet_id);
     if (slot < 0 || sub->inflight_hot[slot].state != INFLIGHT_WAIT_PUBACK) {
-        return; // Unexpected or duplicate - ignore
-    }
-
-    // Ceremony complete - free send_desc (if still held) and release reference
-    u32 sd_idx = sub->inflight_cold[slot].send_desc_idx;
-    if (sd_idx != SEND_DESC_INVALID) {
-        send_desc_pool_free(&b->send_desc_pool, sd_idx);
+        return;
     }
     release_msg_ref(b, sub->inflight_hot[slot].msg_idx);
     client_inflight_free_slot(sub, (u16)slot);
+
+    // Inflight slot freed — kick egress if it was stalled on inflight-full
+    if (sub->egress_count > 0 && !sub->egress_inflight) {
+        u32 slot_idx = (u32)(sub - b->clients);
+        if (egress_flush(b, sub, slot_idx) == EGRESS_FLUSH_SQ_FULL) {
+            egress_flush_enqueue(b, slot_idx);
+        }
+    }
 }
 
 // Called when we receive PUBREC from subscriber (QoS 2 step 2).
-// Transitions to WAIT_PUBCOMP state, sends PUBREL.
+// Transitions to WAIT_PUBCOMP state, sends PUBREL immediately to avoid
+// ceremony latency being coupled to publish egress queue depth.
 INLINE void fsm_sub_pubrec_received(struct broker *b, struct client_slot *sub,
                                     u16 packet_id) {
-    // Direct lookup - we assigned this packet_id, no hash table needed
     i32 slot = client_inflight_find_direct(sub, packet_id);
     if (slot < 0 || sub->inflight_hot[slot].state != INFLIGHT_WAIT_PUBREC) {
-        return; // Unexpected - ignore
+        return;
     }
 
-    // Free send_desc from initial PUBLISH (no longer needed after PUBREC)
-    u32 sd_idx = sub->inflight_cold[slot].send_desc_idx;
-    if (sd_idx != SEND_DESC_INVALID) {
-        send_desc_pool_free(&b->send_desc_pool, sd_idx);
-        sub->inflight_cold[slot].send_desc_idx = SEND_DESC_INVALID;
-    }
+    // Release message buffer early — subscriber already has the data.
+    // Frees buffer pool slots sooner; inflight entry stays for ceremony tracking.
+    release_msg_ref(b, sub->inflight_hot[slot].msg_idx);
+    sub->inflight_hot[slot].msg_idx = MSG_POOL_INVALID;
 
-    // Transition state (hot write + cold write)
-    sub->inflight_hot[slot].state    = INFLIGHT_WAIT_PUBCOMP;
+    // Transition state
+    sub->inflight_hot[slot].state     = INFLIGHT_WAIT_PUBCOMP;
     sub->inflight_cold[slot].deadline = b->now + LLMQ_INFLIGHT_TIMEOUT_MS;
 
-    // Send PUBREL async (hot path - 1000s of these per message)
-    // Fall back to resp_buf path if SQ full (avoids waiting for timeout sweep)
-    if (!submit_send_inf(b, sub, (u16)slot, HDR_PUBREL)) {
-        send_pubrel(b, sub, packet_id);
-    }
+    send_pubrel(b, sub, packet_id);
 }
 
 // Called when we receive PUBCOMP from subscriber (QoS 2 complete).
 // Releases message reference and frees inflight entry.
 INLINE void fsm_sub_pubcomp_received(struct broker *b, struct client_slot *sub,
                                      u16 packet_id) {
-    // Direct lookup - we assigned this packet_id, no hash table needed
     i32 slot = client_inflight_find_direct(sub, packet_id);
     if (slot < 0 || sub->inflight_hot[slot].state != INFLIGHT_WAIT_PUBCOMP) {
-        return; // Unexpected - ignore
-    }
-
-    // Ceremony complete - free send_desc (if still held) and release reference
-    u32 sd_idx = sub->inflight_cold[slot].send_desc_idx;
-    if (sd_idx != SEND_DESC_INVALID) {
-        send_desc_pool_free(&b->send_desc_pool, sd_idx);
+        return;
     }
     release_msg_ref(b, sub->inflight_hot[slot].msg_idx);
     client_inflight_free_slot(sub, (u16)slot);
+
+    // Inflight slot freed — kick egress if it was stalled on inflight-full
+    if (sub->egress_count > 0 && !sub->egress_inflight) {
+        u32 slot_idx = (u32)(sub - b->clients);
+        if (egress_flush(b, sub, slot_idx) == EGRESS_FLUSH_SQ_FULL) {
+            egress_flush_enqueue(b, slot_idx);
+        }
+    }
 }
 
 // =============================================================================
@@ -227,10 +244,6 @@ INLINE void fsm_sub_timeout(struct broker *b, struct client_slot *sub,
 
     // Check if we should give up
     if (cold->dup_count >= LLMQ_MAX_RETRIES) {
-        // Max retries reached - free send_desc if still held, give up
-        if (cold->send_desc_idx != SEND_DESC_INVALID) {
-            send_desc_pool_free(&b->send_desc_pool, cold->send_desc_idx);
-        }
         release_msg_ref(b, hot->msg_idx);
         client_inflight_free_slot(sub, inf_slot);
         b->msgs_dropped++;
@@ -242,22 +255,13 @@ INLINE void fsm_sub_timeout(struct broker *b, struct client_slot *sub,
     cold->deadline = b->now + LLMQ_INFLIGHT_TIMEOUT_MS;
 
     if (hot->state == INFLIGHT_WAIT_PUBCOMP) {
-        // QoS 2: Already received PUBREC, retransmit PUBREL (not PUBLISH)
-        // send_desc from PUBLISH was freed in pubrec_received
+        // QoS 2: retransmit PUBREL immediately; do not queue behind publish backlog.
         send_pubrel(b, sub, hot->packet_id);
         return;
     }
 
-    // Free old send_desc before creating new one for retransmit
-    if (cold->send_desc_idx != SEND_DESC_INVALID) {
-        send_desc_pool_free(&b->send_desc_pool, cold->send_desc_idx);
-        cold->send_desc_idx = SEND_DESC_INVALID;
-    }
-
     // QoS 1 (WAIT_PUBACK) or QoS 2 (WAIT_PUBREC): retransmit PUBLISH with DUP=1
-    i32 sd_idx = msg_prepare_send(b, hot->msg_idx, hot->packet_id, cold->qos, 1,
-                                  client_slot_idx, sub->generation);
-    if (unlikely(sd_idx < 0)) {
+    if (egress_full(sub->egress_count, sub->egress_capacity)) {
         // Can't retry - give up
         release_msg_ref(b, hot->msg_idx);
         client_inflight_free_slot(sub, inf_slot);
@@ -265,9 +269,24 @@ INLINE void fsm_sub_timeout(struct broker *b, struct client_slot *sub,
         return;
     }
 
-    // Link and submit
-    cold->send_desc_idx = (u32)sd_idx;
-    msg_submit(b, (u32)sd_idx, sub->fd);
+    struct egress_segment *seg = egress_push(sub->egress, sub->egress_head,
+                                              sub->egress_count, sub->egress_mask);
+    struct canonical_msg *msg = msg_pool_get(&b->msg_pool, hot->msg_idx);
+    seg->msg_idx   = hot->msg_idx;
+    seg->packet_id = hot->packet_id;
+    seg->kind      = SEG_PUBLISH;
+    seg->qos       = cold->qos;
+    seg->dup       = 1;
+    seg->retain    = msg ? msg->retain : 0;
+    seg->slot_gen  = sub->generation;
+    seg->ctrl_len  = 0;
+    seg->cursor    = 0;
+    if (msg) egress_seg_store_wire_len(seg, egress_publish_wire_len(msg, cold->qos));
+    sub->egress_count++;
+
+    if (egress_flush(b, sub, client_slot_idx) == EGRESS_FLUSH_SQ_FULL) {
+        egress_flush_enqueue(b, client_slot_idx);
+    }
 }
 
 // =============================================================================
@@ -276,8 +295,21 @@ INLINE void fsm_sub_timeout(struct broker *b, struct client_slot *sub,
 
 // Called when a client disconnects.
 // Releases message references for all pending outgoing inflight entries.
+// Also drains the egress queue, releasing QoS 0 refs.
 // Note: caller (broker_free_slot) handles client_inflight_free_all
 INLINE void fsm_client_disconnect(struct broker *b, struct client_slot *c) {
+    // Drain egress queue — release refs for segments still owned by egress.
+    // packet_id==0 means egress owns the ref (QoS 0, or QoS 1/2 not yet flushed).
+    // packet_id>0 means inflight owns the ref (allocated at flush time).
+    while (c->egress_count > 0) {
+        struct egress_segment *seg = egress_head_seg(c->egress, c->egress_head, c->egress_mask);
+        if (seg->kind == SEG_PUBLISH && seg->msg_idx != MSG_POOL_INVALID &&
+            seg->packet_id == 0) {
+            release_msg_ref(b, seg->msg_idx);
+        }
+        egress_pop(&c->egress_head, &c->egress_count, c->egress_mask);
+    }
+
     if (c->inflight_count == 0) {
         return;
     }
@@ -293,11 +325,6 @@ INLINE void fsm_client_disconnect(struct broker *b, struct client_slot *c) {
         // Only release refs for outgoing messages (direction=0)
         // Incoming QoS 2 tracking (direction=1) doesn't hold buffer refs
         if (hot->direction == 0 && hot->msg_idx != MSG_POOL_INVALID) {
-            // Free send_desc if still held (CQE_SKIP: no success CQE to free it)
-            struct inflight_cold *cold = &c->inflight_cold[i];
-            if (cold->send_desc_idx != SEND_DESC_INVALID) {
-                send_desc_pool_free(&b->send_desc_pool, cold->send_desc_idx);
-            }
             release_msg_ref(b, hot->msg_idx);
         }
     }

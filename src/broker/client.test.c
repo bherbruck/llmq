@@ -37,7 +37,6 @@ TEST(inflight_alloc_qos1) {
     ASSERT(c.inflight_hot[idx].state == INFLIGHT_WAIT_PUBACK);
     ASSERT(c.inflight_cold[idx].qos == 1);
     ASSERT(c.inflight_hot[idx].direction == 0); // outgoing
-    ASSERT(c.inflight_cold[idx].send_desc_idx == SEND_DESC_INVALID);
 
     client_inflight_free_all(&c);
 }

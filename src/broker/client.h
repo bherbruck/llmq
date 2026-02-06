@@ -9,6 +9,7 @@
 #include "mem/pool.h"
 #include "mem/msgbuf.h"
 #include "mem/string.h"
+#include "broker/egress.h"
 
 // =============================================================================
 // Compile-time limits (array sizes, can't change at runtime)
@@ -57,19 +58,15 @@ struct inflight_hot {
 
 STATIC_ASSERT(sizeof(struct inflight_hot) == 8, "inflight_hot should be 8 bytes");
 
-// Cold path data - accessed only on state transitions (24 bytes)
+// Cold path data - accessed only on state transitions (16 bytes)
 // Ordered for optimal packing: u64 first for natural alignment
 struct inflight_cold {
     u64 deadline;        // Monotonic timestamp for timeout (0 = no timeout)
-    u32 send_desc_idx;   // Active send_desc (SEND_DESC_INVALID if not sending)
     u8 packet_id_be[2];  // Big-endian packet ID for protocol responses
     u8 qos;              // Original QoS level
     u8 dup_count;        // Retransmission count
-    u8 resp_pkt[4];      // Pre-built protocol response (type+len+packet_id) for async send
-    u8 _pad[4];          // Pad to 24 bytes
+    u8 _pad[4];          // Pad to 16 bytes
 };
-
-// Size verified at runtime during init - should be 24 bytes
 
 // =============================================================================
 // Pending Message (for offline QoS 1/2 delivery)
@@ -152,6 +149,26 @@ struct client_slot {
     // Size 2x max_inflight for good load factor with linear probing
     #define INFLIGHT_HASH_EMPTY 0xFFFF
     u16 *inflight_pkt_hash;                           // packet_id hash → slot_idx
+
+    // === Per-client egress queue (arena-allocated ring buffer) ===
+    struct egress_segment *egress;   // Ring buffer of segments
+    u16 egress_head;                 // Ring head index
+    u16 egress_count;                // Current occupancy
+    u16 egress_capacity;             // Ring size (power of 2)
+    u16 egress_mask;                 // capacity - 1
+
+    u8 egress_inflight;              // 1 if a writev is in-flight for this client
+    u8 egress_retry_queued;          // 1 if queued in global egress flush retry queue
+    u8 egress_batch_count;           // Segments in current batched writev (1..EGRESS_BATCH_MAX)
+    u8 _pad_egress;
+
+    // Scratch area for materializing batched iov at submit time.
+    // Valid only while egress_inflight == 1 (one writev per client).
+    // Up to EGRESS_BATCH_MAX PUBLISH messages per writev to reduce SQE/CQE volume.
+    u8 egress_headers[EGRESS_BATCH_MAX][7]; // Materialized PUBLISH fixed headers
+    u8 egress_pkt_ids[EGRESS_BATCH_MAX][2]; // Big-endian packet_ids for iov
+    u8 _pad_scratch[2];
+    struct iovec egress_iov[EGRESS_BATCH_MAX * 4]; // [hdr][topic][pktid][payload] × batch
 };
 
 // =============================================================================
@@ -202,7 +219,7 @@ INLINE void client_init(struct client_slot *c, i32 fd, u32 recv_buf_idx, u16 max
     c->inflight_free_hint   = 0;
     c->inflight_generation  = 0;
     c->inflight_hash_mask   = 2 * max_inflight - 1;
-    // Fast init: memset arrays to 0xFF (sets msg_idx/send_desc_idx to INVALID)
+    // Fast init: memset arrays to 0xFF (sets msg_idx to INVALID)
     // Then fix up state field which needs to be 0 (INFLIGHT_FREE)
     memset(c->inflight_hot, 0xFF, (usize)max_inflight * sizeof(struct inflight_hot));
     memset(c->inflight_cold, 0xFF, (usize)max_inflight * sizeof(struct inflight_cold));
@@ -211,6 +228,14 @@ INLINE void client_init(struct client_slot *c, i32 fd, u32 recv_buf_idx, u16 max
     }
     // Initialize hash table with memset (INFLIGHT_HASH_EMPTY = 0xFFFF = all 1s)
     memset(c->inflight_pkt_hash, 0xFF, (usize)(2 * max_inflight) * sizeof(u16));
+
+    // Egress queue state
+    c->egress_head      = 0;
+    c->egress_count     = 0;
+    c->egress_inflight     = 0;
+    c->egress_retry_queued = 0;
+    c->egress_batch_count  = 0;
+    // egress, egress_capacity, egress_mask set by broker_init wiring
 }
 
 // Get receive buffer pointer (requires pool reference)
@@ -280,6 +305,8 @@ INLINE void client_go_dormant(struct client_slot *c) {
     c->recv_start   = 0;
     c->recv_len     = 0;
     c->recv_buf_idx = BUF_POOL_INVALID; // Caller should have freed it
+    c->egress_inflight = 0;
+    c->egress_retry_queued = 0;
     // Session data (subscriptions, pending) preserved
 }
 
@@ -296,6 +323,8 @@ INLINE void client_free(struct client_slot *c) {
     c->pending_head   = 0;
     c->pending_tail   = 0;
     c->pending_count  = 0;
+    c->egress_inflight = 0;
+    c->egress_retry_queued = 0;
 }
 
 // Check if slot matches a client ID
@@ -450,7 +479,6 @@ INLINE i32 client_inflight_alloc(struct client_slot *c, u8 qos, u32 msg_idx, u64
     c->inflight_cold[slot].packet_id_be[1] = (u8)(packet_id & 0xFF);
     c->inflight_cold[slot].qos             = qos;
     c->inflight_cold[slot].dup_count       = 0;
-    c->inflight_cold[slot].send_desc_idx   = SEND_DESC_INVALID;
     c->inflight_cold[slot].deadline        = deadline;
 
     c->inflight_count++;
@@ -513,7 +541,6 @@ INLINE i32 client_inflight_track_incoming(struct client_slot *c, u16 packet_id, 
     c->inflight_cold[slot].packet_id_be[1] = (u8)(packet_id & 0xFF);
     c->inflight_cold[slot].qos             = 2;
     c->inflight_cold[slot].dup_count       = 0;
-    c->inflight_cold[slot].send_desc_idx   = SEND_DESC_INVALID;
     c->inflight_cold[slot].deadline        = deadline;
     c->inflight_count++;
     c->inflight_free_hint = (slot + 1) & c->inflight_mask;
@@ -570,7 +597,7 @@ INLINE i32 client_inflight_find(struct client_slot *c, u16 packet_id) {
 }
 
 // Free inflight entry by slot index
-// Note: Caller must handle msg_pool refcount and send_desc_pool separately
+// Note: Caller must handle msg_pool refcount separately
 INLINE void client_inflight_free_slot(struct client_slot *c, u16 slot) {
     if (c->inflight_hot[slot].state != INFLIGHT_FREE) {
         // Only remove from hash table for incoming messages (direction=1)
@@ -579,7 +606,6 @@ INLINE void client_inflight_free_slot(struct client_slot *c, u16 slot) {
             inflight_hash_remove(c, c->inflight_hot[slot].packet_id);
         }
         c->inflight_hot[slot].msg_idx       = MSG_POOL_INVALID;
-        c->inflight_cold[slot].send_desc_idx = SEND_DESC_INVALID;
         c->inflight_hot[slot].state         = INFLIGHT_FREE;
         if (c->inflight_count > 0)
             c->inflight_count--;

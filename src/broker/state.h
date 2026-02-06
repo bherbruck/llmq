@@ -8,6 +8,7 @@
 #include "sys/syscall.h"
 #include "sys/io_uring.h"
 #include "broker/client.h"
+#include "broker/egress.h"
 #include "broker/trie.h"
 #include "mem/msgbuf.h"
 #include "mem/hashmap.h"
@@ -47,13 +48,15 @@ struct broker {
     u32 recv_retry_tail;
     u32 recv_retry_capacity;
 
-    // Send retry queue (for SQ-full recovery during fan-out)
-    // Circular buffer of (fd, send_desc_idx) pairs
-    u64 *send_retry_queue;  // Packed: (fd << 32) | send_desc_idx
-    u32 send_retry_head;
-    u32 send_retry_tail;
-    u32 send_retry_capacity;
+    // Per-client egress segment arena
+    struct egress_segment *egress_arena;
+    u16 egress_capacity;  // Per-client ring size (power of 2, e.g. 256)
 
+    // Egress flush queue (SQ-full recovery: clients needing send retry)
+    u32 *egress_flush_queue;
+    u32 egress_flush_head;
+    u32 egress_flush_tail;
+    u32 egress_flush_capacity;
 
     // fd → slot index mapping (mmap'd)
     i32 *fd_to_slot;
@@ -61,7 +64,6 @@ struct broker {
     // Buffer pools (shared across all clients)
     struct buf_pool recv_pool;          // Receive buffers (one per active client)
     struct msg_pool msg_pool;           // Canonical message metadata for zero-copy fan-out
-    struct send_desc_pool send_desc_pool; // Send descriptors for active sends
 
     // Free slot tracking
     u32 free_head;     // Head of free list
@@ -88,14 +90,14 @@ struct broker {
     u64 msgs_published;
     u64 msgs_dropped;             // Total drops (sum of below)
     u64 drops_inflight_full;      // Per-client inflight limit hit
-    u64 drops_send_desc_empty;    // Send descriptor pool exhausted
     u64 drops_msg_pool_empty;     // Message pool exhausted
     u64 drops_sq_full;            // SQ full during fan-out submit
     u64 drops_send_failed;        // Send completions with error
     u64 drops_resp_full;          // Protocol response dropped (resp_slots busy)
+    u64 drops_egress_full;        // Per-client egress queue full
     u64 stolen_buffers;           // Count of recv buffers stolen for fan-out
     u64 recv_retries;             // Count of recv submissions retried from SQ-full
-    u64 send_retries;             // Count of send submissions retried from SQ-full
+    u64 egress_retries;           // Count of egress flushes retried from SQ-full
 };
 
 // =============================================================================
@@ -103,8 +105,11 @@ struct broker {
 // =============================================================================
 
 INLINE i32 broker_init(struct broker *b, u32 max_clients, u32 max_fds, u16 max_inflight,
-                       u32 recv_buf_size, u32 msg_pool_size, u32 send_desc_initial,
-                       u32 send_desc_max) {
+                       u32 recv_buf_size, u32 msg_pool_size, u16 egress_capacity) {
+    if (egress_capacity == 0 || (egress_capacity & (egress_capacity - 1)) != 0) {
+        return -1;
+    }
+
     b->max_clients   = max_clients;
     b->max_fds       = max_fds;
     b->max_inflight  = max_inflight;
@@ -116,22 +121,22 @@ INLINE i32 broker_init(struct broker *b, u32 max_clients, u32 max_fds, u16 max_i
     b->recv_retry_capacity = max_clients + 1;
     b->recv_retry_head     = 0;
     b->recv_retry_tail     = 0;
-    usize recv_recv_retry_size  = (usize)b->recv_retry_capacity * sizeof(u32);
-    b->recv_retry_queue    = (u32 *)sys_mmap(NULL, recv_recv_retry_size, PROT_READ | PROT_WRITE,
+    usize recv_retry_size  = (usize)b->recv_retry_capacity * sizeof(u32);
+    b->recv_retry_queue    = (u32 *)sys_mmap(NULL, recv_retry_size, PROT_READ | PROT_WRITE,
                                               MAP_PRIVATE | MAP_ANON, -1, 0);
     if (IS_ERR(b->recv_retry_queue)) {
         return -1;
     }
 
-    // Initialize send retry queue (sized for burst fan-out - max_clients * 16 sends)
-    b->send_retry_capacity = max_clients * 16;
-    b->send_retry_head     = 0;
-    b->send_retry_tail     = 0;
-    usize send_recv_retry_size  = (usize)b->send_retry_capacity * sizeof(u64);
-    b->send_retry_queue    = (u64 *)sys_mmap(NULL, send_recv_retry_size, PROT_READ | PROT_WRITE,
-                                              MAP_PRIVATE | MAP_ANON, -1, 0);
-    if (IS_ERR(b->send_retry_queue)) {
-        sys_munmap(b->recv_retry_queue, recv_recv_retry_size);
+    // Initialize egress flush queue (sized to max_clients + 1)
+    b->egress_flush_capacity = max_clients + 1;
+    b->egress_flush_head     = 0;
+    b->egress_flush_tail     = 0;
+    usize egress_flush_size  = (usize)b->egress_flush_capacity * sizeof(u32);
+    b->egress_flush_queue    = (u32 *)sys_mmap(NULL, egress_flush_size, PROT_READ | PROT_WRITE,
+                                                MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (IS_ERR(b->egress_flush_queue)) {
+        sys_munmap(b->recv_retry_queue, recv_retry_size);
         return -1;
     }
 
@@ -139,25 +144,16 @@ INLINE i32 broker_init(struct broker *b, u32 max_clients, u32 max_fds, u16 max_i
 
     // Recv pool: one buffer per potential active client
     if (buf_pool_init(&b->recv_pool, max_clients, recv_buf_size) < 0) {
-        sys_munmap(b->send_retry_queue, b->send_retry_capacity * sizeof(u64));
-        sys_munmap(b->recv_retry_queue, b->recv_retry_capacity * sizeof(u32));
+        sys_munmap(b->egress_flush_queue, egress_flush_size);
+        sys_munmap(b->recv_retry_queue, recv_retry_size);
         return -1;
     }
 
     // Message pool: canonical message metadata for zero-copy fan-out
     if (msg_pool_init(&b->msg_pool, msg_pool_size) < 0) {
         buf_pool_cleanup(&b->recv_pool);
-        sys_munmap(b->send_retry_queue, b->send_retry_capacity * sizeof(u64));
-        sys_munmap(b->recv_retry_queue, b->recv_retry_capacity * sizeof(u32));
-        return -1;
-    }
-
-    // Send descriptor pool: ephemeral send state for active sends (dynamic growth)
-    if (send_desc_pool_init(&b->send_desc_pool, send_desc_initial, send_desc_max) < 0) {
-        msg_pool_cleanup(&b->msg_pool);
-        buf_pool_cleanup(&b->recv_pool);
-        sys_munmap(b->send_retry_queue, b->send_retry_capacity * sizeof(u64));
-        sys_munmap(b->recv_retry_queue, b->recv_retry_capacity * sizeof(u32));
+        sys_munmap(b->egress_flush_queue, egress_flush_size);
+        sys_munmap(b->recv_retry_queue, recv_retry_size);
         return -1;
     }
 
@@ -166,11 +162,10 @@ INLINE i32 broker_init(struct broker *b, u32 max_clients, u32 max_fds, u16 max_i
     b->clients         = (struct client_slot *)sys_mmap(NULL, clients_size, PROT_READ | PROT_WRITE,
                                                         MAP_PRIVATE | MAP_ANON, -1, 0);
     if (IS_ERR(b->clients)) {
-        send_desc_pool_cleanup(&b->send_desc_pool);
         msg_pool_cleanup(&b->msg_pool);
         buf_pool_cleanup(&b->recv_pool);
-        sys_munmap(b->send_retry_queue, b->send_retry_capacity * sizeof(u64));
-        sys_munmap(b->recv_retry_queue, b->recv_retry_capacity * sizeof(u32));
+        sys_munmap(b->egress_flush_queue, egress_flush_size);
+        sys_munmap(b->recv_retry_queue, recv_retry_size);
         return -1;
     }
 
@@ -192,17 +187,33 @@ INLINE i32 broker_init(struct broker *b, u32 max_clients, u32 max_fds, u16 max_i
 
     if (IS_ERR(b->inflight_hot_arena) || IS_ERR(b->inflight_cold_arena) ||
         IS_ERR(b->inflight_hash_arena) || IS_ERR(b->pending_arena)) {
-        // Cleanup on failure (IS_ERR pointers are negative, won't match real ptrs)
         if (!IS_ERR(b->inflight_hot_arena))  sys_munmap(b->inflight_hot_arena, hot_arena_size);
         if (!IS_ERR(b->inflight_cold_arena)) sys_munmap(b->inflight_cold_arena, cold_arena_size);
         if (!IS_ERR(b->inflight_hash_arena)) sys_munmap(b->inflight_hash_arena, hash_arena_size);
         if (!IS_ERR(b->pending_arena))       sys_munmap(b->pending_arena, pend_arena_size);
         sys_munmap(b->clients, clients_size);
-        send_desc_pool_cleanup(&b->send_desc_pool);
         msg_pool_cleanup(&b->msg_pool);
         buf_pool_cleanup(&b->recv_pool);
-        sys_munmap(b->send_retry_queue, b->send_retry_capacity * sizeof(u64));
-        sys_munmap(b->recv_retry_queue, b->recv_retry_capacity * sizeof(u32));
+        sys_munmap(b->egress_flush_queue, egress_flush_size);
+        sys_munmap(b->recv_retry_queue, recv_retry_size);
+        return -1;
+    }
+
+    // Per-client egress arena
+    b->egress_capacity = egress_capacity;
+    usize egress_arena_size = (usize)max_clients * egress_capacity * sizeof(struct egress_segment);
+    b->egress_arena = (struct egress_segment *)sys_mmap(
+        NULL, egress_arena_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (IS_ERR(b->egress_arena)) {
+        sys_munmap(b->inflight_hot_arena, hot_arena_size);
+        sys_munmap(b->inflight_cold_arena, cold_arena_size);
+        sys_munmap(b->inflight_hash_arena, hash_arena_size);
+        sys_munmap(b->pending_arena, pend_arena_size);
+        sys_munmap(b->clients, clients_size);
+        msg_pool_cleanup(&b->msg_pool);
+        buf_pool_cleanup(&b->recv_pool);
+        sys_munmap(b->egress_flush_queue, egress_flush_size);
+        sys_munmap(b->recv_retry_queue, recv_retry_size);
         return -1;
     }
 
@@ -212,6 +223,9 @@ INLINE i32 broker_init(struct broker *b, u32 max_clients, u32 max_fds, u16 max_i
         b->clients[i].inflight_cold     = &b->inflight_cold_arena[(usize)i * max_inflight];
         b->clients[i].inflight_pkt_hash = &b->inflight_hash_arena[(usize)i * hash_size];
         b->clients[i].pending           = &b->pending_arena[(usize)i * LLMQ_MAX_PENDING_MSGS];
+        b->clients[i].egress            = &b->egress_arena[(usize)i * egress_capacity];
+        b->clients[i].egress_capacity   = egress_capacity;
+        b->clients[i].egress_mask       = egress_capacity - 1;
     }
 
     // mmap fd_to_slot mapping
@@ -219,16 +233,16 @@ INLINE i32 broker_init(struct broker *b, u32 max_clients, u32 max_fds, u16 max_i
     b->fd_to_slot =
         (i32 *)sys_mmap(NULL, fd_map_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
     if (IS_ERR(b->fd_to_slot)) {
+        sys_munmap(b->egress_arena, egress_arena_size);
         sys_munmap(b->inflight_hot_arena, hot_arena_size);
         sys_munmap(b->inflight_cold_arena, cold_arena_size);
         sys_munmap(b->inflight_hash_arena, hash_arena_size);
         sys_munmap(b->pending_arena, pend_arena_size);
         sys_munmap(b->clients, clients_size);
-        send_desc_pool_cleanup(&b->send_desc_pool);
         msg_pool_cleanup(&b->msg_pool);
         buf_pool_cleanup(&b->recv_pool);
-        sys_munmap(b->send_retry_queue, b->send_retry_capacity * sizeof(u64));
-        sys_munmap(b->recv_retry_queue, b->recv_retry_capacity * sizeof(u32));
+        sys_munmap(b->egress_flush_queue, egress_flush_size);
+        sys_munmap(b->recv_retry_queue, recv_retry_size);
         return -1;
     }
 
@@ -255,16 +269,16 @@ INLINE i32 broker_init(struct broker *b, u32 max_clients, u32 max_fds, u16 max_i
     // Initialize client_id hash table (sized for 2x max_clients for low load factor)
     if (hashmap_init(&b->client_map, max_clients * 2) < 0) {
         sys_munmap(b->fd_to_slot, fd_map_size);
+        sys_munmap(b->egress_arena, egress_arena_size);
         sys_munmap(b->inflight_hot_arena, hot_arena_size);
         sys_munmap(b->inflight_cold_arena, cold_arena_size);
         sys_munmap(b->inflight_hash_arena, hash_arena_size);
         sys_munmap(b->pending_arena, pend_arena_size);
         sys_munmap(b->clients, clients_size);
-        sys_munmap(b->send_retry_queue, b->send_retry_capacity * sizeof(u64));
-        sys_munmap(b->recv_retry_queue, b->recv_retry_capacity * sizeof(u32));
+        sys_munmap(b->egress_flush_queue, egress_flush_size);
+        sys_munmap(b->recv_retry_queue, recv_retry_size);
         buf_pool_cleanup(&b->recv_pool);
         msg_pool_cleanup(&b->msg_pool);
-        send_desc_pool_cleanup(&b->send_desc_pool);
         return -1;
     }
 
@@ -303,6 +317,10 @@ INLINE void broker_cleanup(struct broker *b) {
         sys_munmap(b->pending_arena,
                    (usize)b->max_clients * LLMQ_MAX_PENDING_MSGS * sizeof(struct pending_msg));
     }
+    if (b->egress_arena) {
+        sys_munmap(b->egress_arena,
+                   (usize)b->max_clients * b->egress_capacity * sizeof(struct egress_segment));
+    }
     if (b->clients) {
         sys_munmap(b->clients, b->max_clients * sizeof(struct client_slot));
     }
@@ -312,12 +330,11 @@ INLINE void broker_cleanup(struct broker *b) {
     if (b->recv_retry_queue) {
         sys_munmap(b->recv_retry_queue, b->recv_retry_capacity * sizeof(u32));
     }
-    if (b->send_retry_queue) {
-        sys_munmap(b->send_retry_queue, b->send_retry_capacity * sizeof(u64));
+    if (b->egress_flush_queue) {
+        sys_munmap(b->egress_flush_queue, b->egress_flush_capacity * sizeof(u32));
     }
     buf_pool_cleanup(&b->recv_pool);
     msg_pool_cleanup(&b->msg_pool);
-    send_desc_pool_cleanup(&b->send_desc_pool);
     hashmap_cleanup(&b->client_map);
 }
 
@@ -356,46 +373,52 @@ INLINE u32 recv_retry_dequeue(struct broker *b) {
 }
 
 // =============================================================================
-// Send Retry Queue (for SQ-full recovery during fan-out)
-// Stores (fd, send_desc_idx) pairs - NO data copy, just indices
+// Egress Flush Queue (for SQ-full recovery during fan-out)
+// Stores encoded egress context: (slot_idx << 8) | generation
 // =============================================================================
 
-// Pack fd and send_desc_idx into u64
-#define SEND_RETRY_PACK(fd, sd_idx) (((u64)(fd) << 32) | (u64)(sd_idx))
-#define SEND_RETRY_FD(packed)       ((i32)((packed) >> 32))
-#define SEND_RETRY_SD_IDX(packed)   ((u32)((packed) & 0xFFFFFFFF))
+#define MAKE_EGRESS_CTX(slot_idx, gen) ((((slot_idx) & 0xFFFFFF) << 8) | ((u32)(gen) & 0xFF))
+#define EGRESS_CTX_SLOT(ctx)           (((ctx) >> 8) & 0xFFFFFF)
+#define EGRESS_CTX_GEN(ctx)            ((u8)((ctx) & 0xFF))
 
-// Check if send retry queue is empty
-INLINE bool send_retry_empty(struct broker *b) {
-    return b->send_retry_head == b->send_retry_tail;
+INLINE bool egress_flush_empty(struct broker *b) {
+    return b->egress_flush_head == b->egress_flush_tail;
 }
 
-// Check if send retry queue is full
-INLINE bool send_retry_full(struct broker *b) {
-    u32 next = (b->send_retry_tail + 1) % b->send_retry_capacity;
-    return next == b->send_retry_head;
+INLINE bool egress_flush_full(struct broker *b) {
+    u32 next = (b->egress_flush_tail + 1) % b->egress_flush_capacity;
+    return next == b->egress_flush_head;
 }
 
-// Enqueue (fd, send_desc_idx) for send retry
-// Returns true if enqueued, false if queue full
-INLINE bool send_retry_enqueue(struct broker *b, i32 fd, u32 send_desc_idx) {
-    if (send_retry_full(b)) {
-        return false;
+INLINE void egress_flush_enqueue(struct broker *b, u32 slot_idx) {
+    if (slot_idx >= b->max_clients) {
+        return;
     }
-    b->send_retry_queue[b->send_retry_tail] = SEND_RETRY_PACK(fd, send_desc_idx);
-    b->send_retry_tail = (b->send_retry_tail + 1) % b->send_retry_capacity;
-    return true;
+
+    struct client_slot *c = &b->clients[slot_idx];
+    if (c->egress_retry_queued) {
+        return;
+    }
+    if (egress_flush_full(b)) {
+        b->drops_sq_full++;
+        return;
+    }
+    b->egress_flush_queue[b->egress_flush_tail] = MAKE_EGRESS_CTX(slot_idx, c->generation);
+    c->egress_retry_queued = 1;
+    b->egress_flush_tail = (b->egress_flush_tail + 1) % b->egress_flush_capacity;
 }
 
-// Dequeue (fd, send_desc_idx) for send retry
-// Returns packed value, or 0 if empty (check with send_retry_empty first)
-INLINE u64 send_retry_dequeue(struct broker *b) {
-    if (send_retry_empty(b)) {
-        return 0;
+INLINE u32 egress_flush_dequeue(struct broker *b) {
+    if (egress_flush_empty(b)) {
+        return MAKE_EGRESS_CTX(b->max_clients, 0); // Sentinel: invalid slot
     }
-    u64 packed         = b->send_retry_queue[b->send_retry_head];
-    b->send_retry_head = (b->send_retry_head + 1) % b->send_retry_capacity;
-    return packed;
+    u32 ctx                = b->egress_flush_queue[b->egress_flush_head];
+    b->egress_flush_head   = (b->egress_flush_head + 1) % b->egress_flush_capacity;
+    u32 slot_idx = EGRESS_CTX_SLOT(ctx);
+    if (slot_idx < b->max_clients) {
+        b->clients[slot_idx].egress_retry_queued = 0;
+    }
+    return ctx;
 }
 
 // =============================================================================
@@ -587,8 +610,7 @@ enum op_type {
     OP_RECV      = 2,
     OP_SEND      = 3,
     OP_CLOSE     = 4,
-    OP_SEND_ZC   = 5, // Zero-copy send: context = send_desc index
-    OP_SEND_INF  = 6, // Send from inflight entry: context = slot_idx, buffer is inflight.resp_pkt
+    OP_EGRESS    = 5, // Per-client egress writev: context = (slot_idx << 8) | generation
     OP_SEND_RESP = 7, // Protocol response from resp_buf: context = (slot_idx << 8) | resp_slot
 };
 

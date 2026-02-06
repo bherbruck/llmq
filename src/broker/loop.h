@@ -133,68 +133,6 @@ INLINE void submit_send(struct broker *b, i32 fd, const u8 *buf, u32 len) {
     // No flush - batched with other SQEs, flushed at end of event loop
 }
 
-// Internal: actually submit the zc send SQE (called from submit_send_zc and process_send_retries)
-// Returns true on success, false if SQ full
-INLINE bool submit_send_zc_internal(struct broker *b, i32 fd, u32 send_desc_idx) {
-    struct io_uring_sqe *sqe = ring_get_sqe(&b->ring);
-    if (!sqe) {
-        return false; // SQ full - caller should queue for retry
-    }
-
-    struct send_desc *sd = send_desc_pool_get(&b->send_desc_pool, send_desc_idx);
-    if (!sd) {
-        log_error("Invalid send_desc_idx: %u", send_desc_idx);
-        return true; // Not an SQ issue, don't retry
-    }
-
-    // iov[2] has len=0 for QoS 0, so always send all 4 iovecs
-    ring_prep_writev(sqe, fd, sd->iov, 4, 0);
-    sqe->user_data = make_user_data(OP_SEND_ZC, (u32)fd, send_desc_idx);
-    return true;
-}
-
-// Clean up send_desc when dropping (SQ full and retry queue also full)
-INLINE void drop_send_zc(struct broker *b, u32 send_desc_idx) {
-    b->msgs_dropped++;
-    b->drops_sq_full++;
-
-    struct send_desc *sd = send_desc_pool_get(&b->send_desc_pool, send_desc_idx);
-    if (sd && sd->msg_idx != MSG_POOL_INVALID) {
-        // For QoS 0: release ref now (no inflight entry exists)
-        // For QoS > 0: inflight entry exists and holds the ref - let timeout/disconnect clean it up
-        if (sd->sub_qos == 0) {
-            u32 new_ref = msg_pool_unref(&b->msg_pool, sd->msg_idx);
-            if (new_ref == 0) {
-                struct canonical_msg *msg = msg_pool_get(&b->msg_pool, sd->msg_idx);
-                if (msg && msg->buf_idx != MSG_POOL_INVALID) {
-                    buf_pool_free(&b->recv_pool, msg->buf_idx);
-                }
-                msg_pool_free(&b->msg_pool, sd->msg_idx);
-            }
-        }
-    }
-    send_desc_pool_free(&b->send_desc_pool, send_desc_idx);
-}
-
-// Submit zero-copy send using send descriptor's scatter-gather iovecs
-// Context is the send_desc_pool index for completion handling
-// If SQ full, queues for retry instead of dropping
-// NOTE: Does NOT flush SQEs - caller must call ring_flush_sqes() when batch is complete
-INLINE void submit_send_zc(struct broker *b, i32 fd, u32 send_desc_idx) {
-    if (submit_send_zc_internal(b, fd, send_desc_idx)) {
-        return; // Success
-    }
-
-    // SQ full - try to queue for retry
-    if (send_retry_enqueue(b, fd, send_desc_idx)) {
-        return; // Queued for retry
-    }
-
-    // Both SQ and retry queue full - must drop
-    log_debug("SQ and retry queue full, dropping zc send fd=%d", fd);
-    drop_send_zc(b, send_desc_idx);
-}
-
 // =============================================================================
 // Async Protocol Responses via io_uring (batched with other operations)
 // =============================================================================
@@ -299,40 +237,6 @@ INLINE bool send_buf(struct broker *b, struct client_slot *c, const void *buf, u
     return submit_send_resp_slot(b, c, resp_slot, len);
 }
 
-// =============================================================================
-// Async Protocol Responses (for high-volume QoS flows)
-// =============================================================================
-
-// Submit async send for protocol response from inflight entry
-// The response is pre-built in inflight_cold->resp_pkt, which lives until ceremony completes
-// Returns true if queued, false if SQ full
-INLINE bool submit_send_inf(struct broker *b, struct client_slot *c,
-                            u16 inf_slot, const u8 *hdr) {
-    if (c->state != CLIENT_ACTIVE) {
-        return false;
-    }
-
-    struct io_uring_sqe *sqe = get_sqe_with_flush(b);
-    if (!sqe) {
-        return false;
-    }
-
-    struct inflight_cold *cold = &c->inflight_cold[inf_slot];
-
-    // Build response packet in inflight buffer (lives until ceremony completes)
-    cold->resp_pkt[0] = hdr[0];
-    cold->resp_pkt[1] = hdr[1];
-    cold->resp_pkt[2] = cold->packet_id_be[0];
-    cold->resp_pkt[3] = cold->packet_id_be[1];
-
-    u32 slot_idx = (u32)(c - b->clients);
-    ring_prep_send(sqe, c->fd, cold->resp_pkt, 4, 0);
-    sqe->user_data = make_user_data(OP_SEND_INF, (u32)c->fd, slot_idx);
-    sqe->flags |= IOSQE_CQE_SKIP_SUCCESS;
-    // No flush - batched with other SQEs, flushed at end of event loop
-    return true;
-}
-
 // Submit close and mark client as CLOSING to prevent new operations on this fd.
 // This prevents the fd-reuse race where a recv CQE arrives after fd is closed
 // and reused for a new connection.
@@ -378,6 +282,265 @@ INLINE void release_msg_ref(struct broker *b, u32 msg_idx) {
 // Include handler after submit functions are defined
 // Note: handler.h includes mqtt_fsm.h which provides fsm_client_disconnect, fsm_sweep_all_timeouts
 #include "broker/handler.h"
+
+// =============================================================================
+// Egress Flush Engine
+// =============================================================================
+
+// Discard unsent segment (stale, invalid msg/buf, pre-send error).
+// Releases ref if egress owns it (packet_id==0 → no inflight allocated).
+INLINE void egress_discard_head(struct broker *b, struct client_slot *c,
+                                struct egress_segment *seg) {
+    if (seg->kind == SEG_PUBLISH && seg->msg_idx != MSG_POOL_INVALID &&
+        seg->packet_id == 0) {
+        release_msg_ref(b, seg->msg_idx);
+    }
+    egress_pop(&c->egress_head, &c->egress_count, c->egress_mask);
+}
+
+// Pop head after successful send completion.
+// QoS 0: release ref. QoS 1/2: ref now owned by inflight entry.
+INLINE void egress_complete_head(struct broker *b, struct client_slot *c,
+                                 struct egress_segment *seg) {
+    if (seg->kind == SEG_PUBLISH && seg->qos == 0 && seg->msg_idx != MSG_POOL_INVALID) {
+        release_msg_ref(b, seg->msg_idx);
+    }
+    egress_pop(&c->egress_head, &c->egress_count, c->egress_mask);
+}
+
+INLINE void egress_apply_cursor(struct iovec *iov, u8 iov_cnt, u32 cursor) {
+    for (u8 i = 0; i < iov_cnt && cursor > 0; i++) {
+        u32 len = (u32)iov[i].iov_len;
+        if (len == 0) {
+            continue;
+        }
+        if (cursor >= len) {
+            cursor -= len;
+            iov[i].iov_len = 0;
+            continue;
+        }
+        iov[i].iov_base = (u8 *)iov[i].iov_base + cursor;
+        iov[i].iov_len  = len - cursor;
+        cursor          = 0;
+    }
+}
+
+// Flush client's egress queue via io_uring.
+// Batches up to EGRESS_BATCH_MAX consecutive PUBLISH segments into one writev.
+// CTRL segments are sent individually (small, infrequent).
+// Returns:
+//  - EGRESS_FLUSH_SUBMITTED: SQE queued
+//  - EGRESS_FLUSH_SQ_FULL: SQ full, caller should retry later
+//  - EGRESS_FLUSH_NOOP: nothing to do (empty/inflight/inactive)
+INLINE u8 egress_flush(struct broker *b, struct client_slot *c, u32 slot_idx) {
+    if (c->egress_inflight || c->egress_count == 0 || c->state != CLIENT_ACTIVE)
+        return EGRESS_FLUSH_NOOP;
+
+    // Pre-clean: discard stale/completed segments from head.
+    while (c->egress_count > 0) {
+        struct egress_segment *seg = egress_head_seg(c->egress, c->egress_head, c->egress_mask);
+        if (seg->slot_gen != c->generation) {
+            egress_discard_head(b, c, seg);
+            continue;
+        }
+        if (seg->kind == SEG_PUBLISH) {
+            u32 wl = egress_seg_load_wire_len(seg);
+            if (wl == 0 || seg->cursor >= wl) { egress_discard_head(b, c, seg); continue; }
+        } else if (seg->kind == SEG_CTRL) {
+            if (seg->ctrl_len == 0 || seg->cursor >= seg->ctrl_len) {
+                egress_discard_head(b, c, seg);
+                continue;
+            }
+        } else {
+            egress_discard_head(b, c, seg);
+            continue;
+        }
+        break;
+    }
+    if (c->egress_count == 0)
+        return EGRESS_FLUSH_NOOP;
+
+    struct egress_segment *head = egress_head_seg(c->egress, c->egress_head, c->egress_mask);
+
+    // --- SEG_CTRL: send alone (not batched) ---
+    if (head->kind == SEG_CTRL) {
+        struct io_uring_sqe *sqe = ring_get_sqe(&b->ring);
+        if (!sqe) { b->drops_sq_full++; return EGRESS_FLUSH_SQ_FULL; }
+        ring_prep_send(sqe, c->fd, head->ctrl + head->cursor,
+                       head->ctrl_len - head->cursor, 0);
+        sqe->user_data = make_user_data(OP_EGRESS, (u32)c->fd,
+                                        MAKE_EGRESS_CTX(slot_idx, c->generation));
+        c->egress_inflight    = 1;
+        c->egress_batch_count = 1;
+        return EGRESS_FLUSH_SUBMITTED;
+    }
+
+    // --- SEG_PUBLISH: batch up to EGRESS_BATCH_MAX consecutive segments ---
+    u8 batch   = 0;
+    u8 iov_cnt = 0;
+
+    for (u8 i = 0; i < EGRESS_BATCH_MAX && (u16)i < c->egress_count; i++) {
+        struct egress_segment *seg = &c->egress[(c->egress_head + i) & c->egress_mask];
+
+        if (seg->kind != SEG_PUBLISH || seg->slot_gen != c->generation)
+            break;
+
+        struct canonical_msg *msg = msg_pool_get(&b->msg_pool, seg->msg_idx);
+        if (!msg) break;
+        u8 *msgbuf = buf_pool_get(&b->recv_pool, msg->buf_idx);
+        if (!msgbuf) break;
+
+        u32 wire_len = egress_seg_load_wire_len(seg);
+        if (wire_len == 0) break;
+
+        // Only first segment can have non-zero cursor (partial resume)
+        if (i > 0 && seg->cursor > 0) break;
+
+        // QoS 1/2: allocate inflight at send time (deferred from fan-out).
+        // packet_id==0 means first send; packet_id>0 means retransmit.
+        if (seg->qos > 0 && seg->packet_id == 0) {
+            u64 deadline = b->now + LLMQ_INFLIGHT_TIMEOUT_MS;
+            u16 packet_id;
+            i32 inf_idx = client_inflight_alloc(c, seg->qos, seg->msg_idx,
+                                                 deadline, &packet_id);
+            if (inf_idx < 0) {
+                if (batch == 0) return EGRESS_FLUSH_NOOP;
+                break; // Send what we have so far
+            }
+            seg->packet_id = packet_id;
+        }
+
+        // Build fixed header: type(0x30) + flags, remaining length, topic length.
+        u32 remaining = 2 + msg->topic_len + msg->payload_len;
+        if (seg->qos > 0) remaining += 2;
+        u8 flags = 0;
+        if (seg->retain) flags |= 0x01;
+        flags |= (seg->qos << 1) & 0x06;
+        if (seg->dup) flags |= 0x08;
+        c->egress_headers[batch][0] = 0x30 | flags;
+        u8 pos = 1;
+        u32 x  = remaining;
+        do {
+            u8 byte = (u8)(x & 0x7F);
+            x >>= 7;
+            if (x > 0) byte |= 0x80;
+            c->egress_headers[batch][pos++] = byte;
+        } while (x > 0);
+        c->egress_headers[batch][pos++] = (u8)(msg->topic_len >> 8);
+        c->egress_headers[batch][pos++] = (u8)(msg->topic_len & 0xFF);
+
+        // Build iov: [header][topic][pktid][payload]
+        c->egress_iov[iov_cnt].iov_base = c->egress_headers[batch];
+        c->egress_iov[iov_cnt].iov_len  = pos;
+        iov_cnt++;
+        c->egress_iov[iov_cnt].iov_base = msgbuf + msg->topic_off;
+        c->egress_iov[iov_cnt].iov_len  = msg->topic_len;
+        iov_cnt++;
+        if (seg->qos > 0) {
+            c->egress_pkt_ids[batch][0]     = (u8)(seg->packet_id >> 8);
+            c->egress_pkt_ids[batch][1]     = (u8)(seg->packet_id & 0xFF);
+            c->egress_iov[iov_cnt].iov_base = c->egress_pkt_ids[batch];
+            c->egress_iov[iov_cnt].iov_len  = 2;
+        } else {
+            c->egress_iov[iov_cnt].iov_base = NULL;
+            c->egress_iov[iov_cnt].iov_len  = 0;
+        }
+        iov_cnt++;
+        c->egress_iov[iov_cnt].iov_base = msgbuf + msg->payload_off;
+        c->egress_iov[iov_cnt].iov_len  = msg->payload_len;
+        iov_cnt++;
+
+        batch++;
+    }
+
+    if (batch == 0)
+        return EGRESS_FLUSH_NOOP;
+
+    // Apply cursor to first segment's iov entries (partial send resume)
+    if (head->cursor > 0)
+        egress_apply_cursor(c->egress_iov, 4, head->cursor);
+
+    struct io_uring_sqe *sqe = ring_get_sqe(&b->ring);
+    if (!sqe) { b->drops_sq_full++; return EGRESS_FLUSH_SQ_FULL; }
+
+    ring_prep_writev(sqe, c->fd, c->egress_iov, iov_cnt, 0);
+    sqe->user_data = make_user_data(OP_EGRESS, (u32)c->fd,
+                                    MAKE_EGRESS_CTX(slot_idx, c->generation));
+    c->egress_inflight    = 1;
+    c->egress_batch_count = batch;
+    return EGRESS_FLUSH_SUBMITTED;
+}
+
+// Handle completion of batched egress writev/send.
+// Walks batch segments using pre-stored wire length (no msg_pool_get on CQE path).
+// Ref ownership: QoS 0 released here; QoS 1/2 owned by inflight until ACK.
+INLINE void handle_egress_cqe(struct broker *b, struct io_uring_cqe *cqe) {
+    u32 ctx      = ud_ctx(cqe->user_data);
+    u32 slot_idx = EGRESS_CTX_SLOT(ctx);
+    u8 cqe_gen   = EGRESS_CTX_GEN(ctx);
+    i32 cqe_fd   = (i32)ud_fd(cqe->user_data);
+
+    struct client_slot *c = broker_get_client(b, slot_idx);
+    if (!c || c->generation != cqe_gen || c->fd != cqe_fd)
+        return;
+
+    c->egress_inflight = 0;
+    u8 batch = c->egress_batch_count;
+
+    if (c->egress_count == 0)
+        return;
+
+    if (likely(cqe->res > 0)) {
+        b->bytes_sent += (u64)cqe->res;
+        u32 bytes_left = (u32)cqe->res;
+
+        // Walk batch segments, completing those fully sent
+        for (u8 i = 0; i < batch && c->egress_count > 0 && bytes_left > 0; i++) {
+            struct egress_segment *seg =
+                egress_head_seg(c->egress, c->egress_head, c->egress_mask);
+            u32 wire_len = (seg->kind == SEG_CTRL)
+                               ? (u32)seg->ctrl_len
+                               : egress_seg_load_wire_len(seg);
+            u32 seg_remaining = wire_len - seg->cursor;
+
+            if (bytes_left >= seg_remaining) {
+                bytes_left -= seg_remaining;
+                egress_complete_head(b, c, seg);
+            } else {
+                seg->cursor += bytes_left;
+                bytes_left = 0;
+            }
+        }
+    } else if (cqe->res == -EAGAIN || cqe->res == -EINTR) {
+        // Transient — retry (cursors already at correct positions)
+    } else {
+        // Fatal error — discard all segments in batch
+        b->drops_send_failed++;
+        for (u8 i = 0; i < batch && c->egress_count > 0; i++) {
+            struct egress_segment *seg =
+                egress_head_seg(c->egress, c->egress_head, c->egress_mask);
+            // Undo inflight for first sends (dup=0, packet_id>0)
+            if (seg->kind == SEG_PUBLISH && seg->qos > 0 &&
+                seg->packet_id > 0 && seg->dup == 0) {
+                i32 inf = client_inflight_find_direct(c, seg->packet_id);
+                if (inf >= 0) {
+                    release_msg_ref(b, c->inflight_hot[inf].msg_idx);
+                    client_inflight_free_slot(c, (u16)inf);
+                }
+                egress_pop(&c->egress_head, &c->egress_count, c->egress_mask);
+            } else {
+                egress_discard_head(b, c, seg);
+            }
+        }
+    }
+
+    // Chain: flush next batch if queue non-empty
+    if (c->egress_count > 0 && c->state == CLIENT_ACTIVE) {
+        u8 rc = egress_flush(b, c, slot_idx);
+        if (rc == EGRESS_FLUSH_SQ_FULL)
+            egress_flush_enqueue(b, slot_idx);
+    }
+}
 
 // =============================================================================
 // CQE Handlers
@@ -586,67 +749,6 @@ INLINE void handle_send(struct broker *b, struct io_uring_cqe *cqe) {
     }
 }
 
-// Handle completion of zero-copy send
-// Cleanup: free send_desc, decrement msg refcount, free stolen buffer if last ref
-INLINE void handle_send_zc(struct broker *b, struct io_uring_cqe *cqe) {
-    u32 send_desc_idx = ud_ctx(cqe->user_data);
-
-    struct send_desc *sd = send_desc_pool_get(&b->send_desc_pool, send_desc_idx);
-    if (unlikely(!sd)) {
-        log_error("handle_send_zc: invalid send_desc_idx %u", send_desc_idx);
-        return;
-    }
-
-    if (unlikely(cqe->res < 0)) {
-        log_debug("zc send error fd=%d err=%d", (i32)ud_fd(cqe->user_data), cqe->res);
-        b->msgs_dropped++;
-        b->drops_send_failed++;
-        // Don't close on send error - recv will detect the broken connection.
-        // Closing here risks closing a reused fd.
-    } else {
-        b->bytes_sent += (u64)cqe->res;
-    }
-
-    // For QoS 0: decrement refcount now (fire and forget, no ACK expected)
-    // For QoS > 0: refcount held until ACK ceremony completes (enables retransmission)
-    if (sd->sub_qos == 0) {
-        u32 msg_idx               = sd->msg_idx;
-        struct canonical_msg *msg = msg_pool_get(&b->msg_pool, msg_idx);
-        u32 new_ref               = msg_pool_unref(&b->msg_pool, msg_idx);
-        if (new_ref == 0 && msg) {
-            if (msg->buf_idx != MSG_POOL_INVALID) {
-                buf_pool_free(&b->recv_pool, msg->buf_idx);
-            }
-            msg_pool_free(&b->msg_pool, msg_idx);
-        }
-    }
-
-    // For QoS > 0, handle inflight entry
-    if (sd->sub_qos > 0 && sd->packet_id != 0) {
-        struct client_slot *c = broker_get_client(b, sd->slot_idx);
-        // Check generation to detect slot reuse - if slot was reused,
-        // the old inflight entries are gone and we shouldn't touch new client's inflight
-        if (c && c->generation == sd->slot_gen) {
-            // O(1) lookup: packet_id maps directly to inflight slot
-            u16 inf_idx = (sd->packet_id - 1) & c->inflight_mask;
-            if (c->inflight_hot[inf_idx].packet_id == sd->packet_id &&
-                c->inflight_cold[inf_idx].send_desc_idx == send_desc_idx) {
-                if (cqe->res < 0) {
-                    // Send failed - release ref and free inflight (no ACK coming)
-                    release_msg_ref(b, c->inflight_hot[inf_idx].msg_idx);
-                    client_inflight_free_slot(c, inf_idx);
-                } else {
-                    // Send succeeded - just unlink send_desc, wait for ACK
-                    c->inflight_cold[inf_idx].send_desc_idx = SEND_DESC_INVALID;
-                }
-            }
-        }
-    }
-
-    // Free the send descriptor
-    send_desc_pool_free(&b->send_desc_pool, send_desc_idx);
-}
-
 INLINE void handle_close(struct broker *b, struct io_uring_cqe *cqe) {
     i32 fd = (i32)ud_fd(cqe->user_data);
 
@@ -682,17 +784,11 @@ INLINE void dispatch_cqe(struct broker *b, struct io_uring_cqe *cqe) {
     case OP_SEND:
         handle_send(b, cqe);
         break;
-    case OP_SEND_ZC:
-        handle_send_zc(b, cqe);
+    case OP_EGRESS:
+        handle_egress_cqe(b, cqe);
         break;
     case OP_CLOSE:
         handle_close(b, cqe);
-        break;
-    case OP_SEND_INF:
-        // Protocol response from inflight buffer - just count bytes
-        if (cqe->res > 0) {
-            b->bytes_sent += (u64)cqe->res;
-        }
         break;
     case OP_SEND_RESP: {
         // Protocol response from resp_buf slot - clear in-flight flag
@@ -760,45 +856,39 @@ INLINE u32 process_recv_retries(struct broker *b) {
     return retried;
 }
 
-// Process pending send retries - call after draining CQEs when SQ space is available
-// Returns number of successful retries
-INLINE u32 process_send_retries(struct broker *b) {
+// Process pending egress flushes - call after draining CQEs when SQ space is available
+// Returns number of successful flushes
+INLINE u32 process_egress_flushes(struct broker *b) {
     u32 retried = 0;
 
-    while (!send_retry_empty(b)) {
-        u64 packed       = send_retry_dequeue(b);
-        i32 fd           = SEND_RETRY_FD(packed);
-        u32 send_desc_idx = SEND_RETRY_SD_IDX(packed);
+    while (!egress_flush_empty(b)) {
+        u32 ctx = egress_flush_dequeue(b);
+        u32 slot_idx = EGRESS_CTX_SLOT(ctx);
+        u8 queued_gen = EGRESS_CTX_GEN(ctx);
+        if (slot_idx >= b->max_clients)
+            break;
 
-        struct send_desc *sd = send_desc_pool_get(&b->send_desc_pool, send_desc_idx);
-        if (!sd || sd->state == SEND_FREE) {
-            continue; // Already freed (client disconnected)
+        struct client_slot *c = &b->clients[slot_idx];
+        if (c->generation != queued_gen) {
+            continue; // Stale queued retry after slot reuse
         }
+        if (c->state != CLIENT_ACTIVE || c->egress_count == 0)
+            continue;
 
-        // Validate client is still connected with same fd
-        struct client_slot *c = broker_get_client(b, sd->slot_idx);
-        if (!c || c->state != CLIENT_ACTIVE || c->fd != fd || c->generation != sd->slot_gen) {
-            // Client gone or slot reused - drop the send
-            drop_send_zc(b, send_desc_idx);
+        u8 rc = egress_flush(b, c, slot_idx);
+        if (rc == EGRESS_FLUSH_SUBMITTED) {
+            retried++;
             continue;
         }
-
-        // Try to submit
-        if (!submit_send_zc_internal(b, fd, send_desc_idx)) {
-            // Still SQ full - re-enqueue and stop
-            if (!send_retry_enqueue(b, fd, send_desc_idx)) {
-                // Retry queue also full - drop
-                drop_send_zc(b, send_desc_idx);
-            }
+        if (rc == EGRESS_FLUSH_SQ_FULL) {
+            // SQ still full - re-enqueue and stop
+            egress_flush_enqueue(b, slot_idx);
             break;
         }
-
-        retried++;
     }
 
-    if (retried > 0) {
-        b->send_retries += retried;
-    }
+    if (retried > 0)
+        b->egress_retries += retried;
 
     return retried;
 }
@@ -818,17 +908,13 @@ INLINE u32 process_send_retries(struct broker *b) {
 // Log pool utilization stats
 INLINE void log_pool_stats(struct broker *b) {
     u32 msg_used  = b->msg_pool.capacity - b->msg_pool.free_count;
-    u32 sd_used   = b->send_desc_pool.capacity - b->send_desc_pool.free_count;
     u32 recv_used = b->recv_pool.capacity - b->recv_pool.free_count;
 
-    // Show dynamic pool info: used/capacity (grows to max)
-    // Drop breakdown: if=inflight_full, sd=send_desc_empty, sq=sq_full
-    log_info("POOLS: msg=%u/%u sd=%u/%u(%u) recv=%u/%u active=%u drops=%lu (if=%lu sd=%lu sq=%lu)",
+    log_info("POOLS: msg=%u/%u recv=%u/%u active=%u drops=%lu (if=%lu eg=%lu sf=%lu)",
              msg_used, b->msg_pool.capacity,
-             sd_used, b->send_desc_pool.capacity, b->send_desc_pool.grow_count,
              recv_used, b->recv_pool.capacity,
              b->active_count, b->msgs_dropped,
-             b->drops_inflight_full, b->drops_send_desc_empty, b->drops_sq_full);
+             b->drops_inflight_full, b->drops_egress_full, b->drops_send_failed);
 }
 
 INLINE i32 broker_run(struct broker *b) {
@@ -878,7 +964,7 @@ INLINE i32 broker_run(struct broker *b) {
         ring_cq_flush(&b->ring);
 
         process_recv_retries(b);
-        process_send_retries(b);
+        process_egress_flushes(b);
 
         // Replenish accept queue if it dropped below target
         while (b->accept_pending < ACCEPT_BATCH) {

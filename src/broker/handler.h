@@ -16,13 +16,11 @@
 
 // Forward declare functions (defined in loop.h which includes this file)
 INLINE void submit_send(struct broker *b, i32 fd, const u8 *buf, u32 len);
-INLINE void submit_send_zc(struct broker *b, i32 fd, u32 send_desc_idx);
 INLINE bool send_static(struct broker *b, struct client_slot *c, const void *buf, u32 len);
 INLINE bool send_resp(struct broker *b, struct client_slot *c, const u8 *hdr, u16 packet_id);
 INLINE bool send_buf(struct broker *b, struct client_slot *c, const void *buf, u32 len);
-INLINE bool submit_send_inf(struct broker *b, struct client_slot *c,
-                            u16 inf_slot, const u8 *hdr);
 INLINE void release_msg_ref(struct broker *b, u32 msg_idx);
+INLINE u8 egress_flush(struct broker *b, struct client_slot *c, u32 slot_idx);
 
 // Static headers for zero-copy protocol responses (type<<4 | flags, remaining_len)
 static const u8 HDR_PUBACK[2]   = {0x40, 0x02};
@@ -122,7 +120,7 @@ static i32 forward_publish_zc(struct broker *b, u32 slot_idx, struct client_slot
     // Downgrade QoS to minimum of publisher and subscriber
     u8 effective_qos = (msg->qos < sub_qos) ? msg->qos : sub_qos;
 
-    // Delegate to FSM - it handles refcount, inflight, send_desc, and submission
+    // Delegate to FSM - it handles refcount, inflight, and egress enqueue
     i32 rc = fsm_sub_start_delivery(b, sub, pctx->msg_idx, effective_qos, slot_idx);
     if (rc == 0) {
         pctx->subscriber_count++;
@@ -357,16 +355,6 @@ INLINE i32 process_mqtt_packet_ex(struct broker *b, struct client_slot *c, const
 
         // === Zero-Copy Fan-Out ===
 
-        // Backpressure: if send_desc pool is <10% free, drop message
-        // This prevents cascading failure when sends back up
-        u32 sd_free = b->send_desc_pool.free_count;
-        u32 sd_threshold = b->send_desc_pool.capacity / 10; // 10%
-        if (sd_free < sd_threshold) {
-            b->msgs_dropped++;
-            b->drops_send_desc_empty++;
-            break; // Drop silently - backpressure
-        }
-
         // Allocate canonical message metadata
         u32 msg_idx = msg_pool_alloc(&b->msg_pool);
         if (msg_idx == MSG_POOL_INVALID) {
@@ -406,7 +394,7 @@ INLINE i32 process_mqtt_packet_ex(struct broker *b, struct client_slot *c, const
         msg->dup           = pub_pkt.dup ? 1 : 0;
 
         // Take base reference BEFORE fan-out to prevent premature freeing.
-        // This ensures the buffer survives even if submit_send_zc fails mid-iteration.
+        // This ensures the buffer survives even if egress enqueue fails mid-iteration.
         // Without this, if submit fails and decrements refcount to 0, subsequent
         // subscribers in the same fan-out would access freed memory.
         msg_pool_ref(&b->msg_pool, msg_idx);
