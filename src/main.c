@@ -183,9 +183,12 @@ i32 broker_main(i32 argc, char **argv, char **envp) {
     log_info("Pools: msg=%u/%u (%u%%), recv=%u/%u, stolen=%lu",
              b.msg_pool.high_water, b.msg_pool.capacity, msg_pct,
              b.recv_pool.high_water, b.recv_pool.capacity, b.stolen_buffers);
-    if (b.msgs_dropped > 0 || b.drops_resp_full > 0) {
+    u64 total_drops = b.msgs_dropped + b.drops_inflight_full + b.drops_egress_full +
+                      b.drops_msg_pool_empty + b.drops_sq_full + b.drops_send_failed +
+                      b.drops_resp_full;
+    if (total_drops > 0) {
         log_info("Drops: %lu total (if=%lu eg=%lu msg=%lu sq=%lu fail=%lu resp=%lu)",
-                 b.msgs_dropped, b.drops_inflight_full, b.drops_egress_full,
+                 total_drops, b.drops_inflight_full, b.drops_egress_full,
                  b.drops_msg_pool_empty, b.drops_sq_full, b.drops_send_failed,
                  b.drops_resp_full);
     }

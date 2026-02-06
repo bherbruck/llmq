@@ -189,46 +189,71 @@ INLINE void fsm_sub_puback_received(struct broker *b, struct client_slot *sub,
     }
 }
 
+// Enqueue PUBREL as SEG_CTRL in the egress queue (batched into writev).
+// Falls back to send_resp if egress is full.
+INLINE void enqueue_pubrel(struct broker *b, struct client_slot *sub, u16 packet_id) {
+    if (!egress_full(sub->egress_count, sub->egress_capacity)) {
+        struct egress_segment *seg = egress_push(sub->egress, sub->egress_head,
+                                                  sub->egress_count, sub->egress_mask);
+        seg->kind      = SEG_CTRL;
+        seg->msg_idx   = MSG_POOL_INVALID;
+        seg->packet_id = 0;
+        seg->qos       = 0;
+        seg->slot_gen  = sub->generation;
+        seg->ctrl_len  = 4;
+        seg->ctrl[0]   = 0x62;  // PUBREL fixed header
+        seg->ctrl[1]   = 0x02;
+        seg->ctrl[2]   = (u8)(packet_id >> 8);
+        seg->ctrl[3]   = (u8)(packet_id & 0xFF);
+        seg->cursor    = 0;
+        sub->egress_count++;
+    } else {
+        send_pubrel(b, sub, packet_id);  // Fallback to resp_buf
+    }
+}
+
 // Called when we receive PUBREC from subscriber (QoS 2 step 2).
-// Transitions to WAIT_PUBCOMP state, sends PUBREL immediately to avoid
-// ceremony latency being coupled to publish egress queue depth.
+// Frees inflight immediately — subscriber has the data, no need to hold the
+// slot until PUBCOMP. Enqueues PUBREL via egress (batched into writev).
+// Duplicate PUBRECs also get PUBREL (idempotent).
 INLINE void fsm_sub_pubrec_received(struct broker *b, struct client_slot *sub,
                                     u16 packet_id) {
     i32 slot = client_inflight_find_direct(sub, packet_id);
     if (slot < 0 || sub->inflight_hot[slot].state != INFLIGHT_WAIT_PUBREC) {
+        // Duplicate PUBREC (inflight already freed) — resend PUBREL
+        u32 slot_idx = (u32)(sub - b->clients);
+        enqueue_pubrel(b, sub, packet_id);
+        if (!sub->egress_inflight) {
+            if (egress_flush(b, sub, slot_idx) == EGRESS_FLUSH_SQ_FULL)
+                egress_flush_enqueue(b, slot_idx);
+        }
         return;
     }
 
-    // Release message buffer early — subscriber already has the data.
-    // Frees buffer pool slots sooner; inflight entry stays for ceremony tracking.
+    // Release message buffer — subscriber already has the data
     release_msg_ref(b, sub->inflight_hot[slot].msg_idx);
-    sub->inflight_hot[slot].msg_idx = MSG_POOL_INVALID;
 
-    // Transition state
-    sub->inflight_hot[slot].state     = INFLIGHT_WAIT_PUBCOMP;
-    sub->inflight_cold[slot].deadline = b->now + LLMQ_INFLIGHT_TIMEOUT_MS;
-
-    send_pubrel(b, sub, packet_id);
-}
-
-// Called when we receive PUBCOMP from subscriber (QoS 2 complete).
-// Releases message reference and frees inflight entry.
-INLINE void fsm_sub_pubcomp_received(struct broker *b, struct client_slot *sub,
-                                     u16 packet_id) {
-    i32 slot = client_inflight_find_direct(sub, packet_id);
-    if (slot < 0 || sub->inflight_hot[slot].state != INFLIGHT_WAIT_PUBCOMP) {
-        return;
-    }
-    release_msg_ref(b, sub->inflight_hot[slot].msg_idx);
+    // Free inflight slot immediately — no need to hold until PUBCOMP
     client_inflight_free_slot(sub, (u16)slot);
 
-    // Inflight slot freed — kick egress if it was stalled on inflight-full
+    // Enqueue PUBREL via egress (batched into writev, no extra SQE/syscall)
+    enqueue_pubrel(b, sub, packet_id);
+
+    // Inflight slot freed + PUBREL enqueued — kick egress
     if (sub->egress_count > 0 && !sub->egress_inflight) {
         u32 slot_idx = (u32)(sub - b->clients);
         if (egress_flush(b, sub, slot_idx) == EGRESS_FLUSH_SQ_FULL) {
             egress_flush_enqueue(b, slot_idx);
         }
     }
+}
+
+// Called when we receive PUBCOMP from subscriber (QoS 2 complete).
+// No-op: inflight already freed at PUBREC. PUBCOMP just confirms subscriber
+// received our PUBREL — no state to update.
+INLINE void fsm_sub_pubcomp_received(struct broker *b, struct client_slot *sub,
+                                     u16 packet_id) {
+    (void)b; (void)sub; (void)packet_id;
 }
 
 // =============================================================================
@@ -254,13 +279,8 @@ INLINE void fsm_sub_timeout(struct broker *b, struct client_slot *sub,
     cold->dup_count++;
     cold->deadline = b->now + LLMQ_INFLIGHT_TIMEOUT_MS;
 
-    if (hot->state == INFLIGHT_WAIT_PUBCOMP) {
-        // QoS 2: retransmit PUBREL immediately; do not queue behind publish backlog.
-        send_pubrel(b, sub, hot->packet_id);
-        return;
-    }
-
     // QoS 1 (WAIT_PUBACK) or QoS 2 (WAIT_PUBREC): retransmit PUBLISH with DUP=1
+    // Note: WAIT_PUBCOMP no longer exists — inflight freed at PUBREC
     if (egress_full(sub->egress_count, sub->egress_capacity)) {
         // Can't retry - give up
         release_msg_ref(b, hot->msg_idx);

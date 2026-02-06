@@ -362,27 +362,30 @@ INLINE u8 egress_flush(struct broker *b, struct client_slot *c, u32 slot_idx) {
 
     struct egress_segment *head = egress_head_seg(c->egress, c->egress_head, c->egress_mask);
 
-    // --- SEG_CTRL: send alone (not batched) ---
-    if (head->kind == SEG_CTRL) {
-        struct io_uring_sqe *sqe = ring_get_sqe(&b->ring);
-        if (!sqe) { b->drops_sq_full++; return EGRESS_FLUSH_SQ_FULL; }
-        ring_prep_send(sqe, c->fd, head->ctrl + head->cursor,
-                       head->ctrl_len - head->cursor, 0);
-        sqe->user_data = make_user_data(OP_EGRESS, (u32)c->fd,
-                                        MAKE_EGRESS_CTX(slot_idx, c->generation));
-        c->egress_inflight    = 1;
-        c->egress_batch_count = 1;
-        return EGRESS_FLUSH_SUBMITTED;
-    }
-
-    // --- SEG_PUBLISH: batch up to EGRESS_BATCH_MAX consecutive segments ---
-    u8 batch   = 0;
+    // --- Batch up to EGRESS_BATCH_MAX segments (PUBLISH + CTRL interleaved) ---
+    u8 batch   = 0;   // Total segments in batch
+    u8 pub_idx = 0;   // Index into scratch arrays (PUBLISH only)
     u8 iov_cnt = 0;
 
     for (u8 i = 0; i < EGRESS_BATCH_MAX && (u16)i < c->egress_count; i++) {
         struct egress_segment *seg = &c->egress[(c->egress_head + i) & c->egress_mask];
 
-        if (seg->kind != SEG_PUBLISH || seg->slot_gen != c->generation)
+        if (seg->slot_gen != c->generation)
+            break;
+
+        if (seg->kind == SEG_CTRL) {
+            // CTRL: single iov entry pointing at segment's inline data
+            if (seg->ctrl_len == 0 || seg->cursor >= seg->ctrl_len) break;
+            // Only first segment can have non-zero cursor (partial resume)
+            if (batch > 0 && seg->cursor > 0) break;
+            c->egress_iov[iov_cnt].iov_base = seg->ctrl + seg->cursor;
+            c->egress_iov[iov_cnt].iov_len  = seg->ctrl_len - seg->cursor;
+            iov_cnt++;
+            batch++;
+            continue;
+        }
+
+        if (seg->kind != SEG_PUBLISH)
             break;
 
         struct canonical_msg *msg = msg_pool_get(&b->msg_pool, seg->msg_idx);
@@ -394,7 +397,7 @@ INLINE u8 egress_flush(struct broker *b, struct client_slot *c, u32 slot_idx) {
         if (wire_len == 0) break;
 
         // Only first segment can have non-zero cursor (partial resume)
-        if (i > 0 && seg->cursor > 0) break;
+        if (batch > 0 && seg->cursor > 0) break;
 
         // QoS 1/2: allocate inflight at send time (deferred from fan-out).
         // packet_id==0 means first send; packet_id>0 means retransmit.
@@ -417,29 +420,29 @@ INLINE u8 egress_flush(struct broker *b, struct client_slot *c, u32 slot_idx) {
         if (seg->retain) flags |= 0x01;
         flags |= (seg->qos << 1) & 0x06;
         if (seg->dup) flags |= 0x08;
-        c->egress_headers[batch][0] = 0x30 | flags;
+        c->egress_headers[pub_idx][0] = 0x30 | flags;
         u8 pos = 1;
         u32 x  = remaining;
         do {
             u8 byte = (u8)(x & 0x7F);
             x >>= 7;
             if (x > 0) byte |= 0x80;
-            c->egress_headers[batch][pos++] = byte;
+            c->egress_headers[pub_idx][pos++] = byte;
         } while (x > 0);
-        c->egress_headers[batch][pos++] = (u8)(msg->topic_len >> 8);
-        c->egress_headers[batch][pos++] = (u8)(msg->topic_len & 0xFF);
+        c->egress_headers[pub_idx][pos++] = (u8)(msg->topic_len >> 8);
+        c->egress_headers[pub_idx][pos++] = (u8)(msg->topic_len & 0xFF);
 
         // Build iov: [header][topic][pktid][payload]
-        c->egress_iov[iov_cnt].iov_base = c->egress_headers[batch];
+        c->egress_iov[iov_cnt].iov_base = c->egress_headers[pub_idx];
         c->egress_iov[iov_cnt].iov_len  = pos;
         iov_cnt++;
         c->egress_iov[iov_cnt].iov_base = msgbuf + msg->topic_off;
         c->egress_iov[iov_cnt].iov_len  = msg->topic_len;
         iov_cnt++;
         if (seg->qos > 0) {
-            c->egress_pkt_ids[batch][0]     = (u8)(seg->packet_id >> 8);
-            c->egress_pkt_ids[batch][1]     = (u8)(seg->packet_id & 0xFF);
-            c->egress_iov[iov_cnt].iov_base = c->egress_pkt_ids[batch];
+            c->egress_pkt_ids[pub_idx][0]     = (u8)(seg->packet_id >> 8);
+            c->egress_pkt_ids[pub_idx][1]     = (u8)(seg->packet_id & 0xFF);
+            c->egress_iov[iov_cnt].iov_base = c->egress_pkt_ids[pub_idx];
             c->egress_iov[iov_cnt].iov_len  = 2;
         } else {
             c->egress_iov[iov_cnt].iov_base = NULL;
@@ -450,6 +453,7 @@ INLINE u8 egress_flush(struct broker *b, struct client_slot *c, u32 slot_idx) {
         c->egress_iov[iov_cnt].iov_len  = msg->payload_len;
         iov_cnt++;
 
+        pub_idx++;
         batch++;
     }
 
@@ -457,8 +461,10 @@ INLINE u8 egress_flush(struct broker *b, struct client_slot *c, u32 slot_idx) {
         return EGRESS_FLUSH_NOOP;
 
     // Apply cursor to first segment's iov entries (partial send resume)
-    if (head->cursor > 0)
-        egress_apply_cursor(c->egress_iov, 4, head->cursor);
+    if (head->cursor > 0) {
+        u8 head_iovs = (head->kind == SEG_CTRL) ? 1 : 4;
+        egress_apply_cursor(c->egress_iov, head_iovs, head->cursor);
+    }
 
     struct io_uring_sqe *sqe = ring_get_sqe(&b->ring);
     if (!sqe) { b->drops_sq_full++; return EGRESS_FLUSH_SQ_FULL; }
@@ -910,10 +916,12 @@ INLINE void log_pool_stats(struct broker *b) {
     u32 msg_used  = b->msg_pool.capacity - b->msg_pool.free_count;
     u32 recv_used = b->recv_pool.capacity - b->recv_pool.free_count;
 
+    u64 total_drops = b->msgs_dropped + b->drops_inflight_full + b->drops_egress_full +
+                      b->drops_send_failed;
     log_info("POOLS: msg=%u/%u recv=%u/%u active=%u drops=%lu (if=%lu eg=%lu sf=%lu)",
              msg_used, b->msg_pool.capacity,
              recv_used, b->recv_pool.capacity,
-             b->active_count, b->msgs_dropped,
+             b->active_count, total_drops,
              b->drops_inflight_full, b->drops_egress_full, b->drops_send_failed);
 }
 

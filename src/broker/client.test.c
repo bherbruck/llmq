@@ -232,11 +232,7 @@ TEST(qos2_outgoing_state_transitions) {
 
     ASSERT(c.inflight_hot[slot].state == INFLIGHT_WAIT_PUBREC);
 
-    // Simulate PUBREC received - transition to WAIT_PUBCOMP
-    c.inflight_hot[slot].state = INFLIGHT_WAIT_PUBCOMP;
-    ASSERT(c.inflight_hot[slot].state == INFLIGHT_WAIT_PUBCOMP);
-
-    // Simulate PUBCOMP received - free the entry
+    // Simulate PUBREC received - inflight freed immediately (no WAIT_PUBCOMP)
     client_inflight_free_slot(&c, (u16)slot);
     ASSERT(c.inflight_count == 0);
 }
