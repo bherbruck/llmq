@@ -133,6 +133,12 @@ INLINE void submit_send(struct broker *b, i32 fd, const u8 *buf, u32 len) {
     // No flush - batched with other SQEs, flushed at end of event loop
 }
 
+// Send descriptor context encoding: [8-bit alloc_gen][24-bit send_desc_idx]
+// The alloc_gen detects stale CQEs after disconnect frees a send_desc
+#define MAKE_SD_CTX(idx, gen) (((u32)(gen) << 24) | ((idx) & 0xFFFFFF))
+#define SD_CTX_IDX(ctx)       ((ctx) & 0xFFFFFF)
+#define SD_CTX_GEN(ctx)       ((u8)((ctx) >> 24))
+
 // Internal: actually submit the zc send SQE (called from submit_send_zc and process_send_retries)
 // Returns true on success, false if SQ full
 INLINE bool submit_send_zc_internal(struct broker *b, i32 fd, u32 send_desc_idx) {
@@ -149,7 +155,13 @@ INLINE bool submit_send_zc_internal(struct broker *b, i32 fd, u32 send_desc_idx)
 
     // iov[2] has len=0 for QoS 0, so always send all 4 iovecs
     ring_prep_writev(sqe, fd, sd->iov, 4, 0);
-    sqe->user_data = make_user_data(OP_SEND_ZC, (u32)fd, send_desc_idx);
+    sqe->user_data = make_user_data(OP_SEND_ZC, (u32)fd, MAKE_SD_CTX(send_desc_idx, sd->alloc_gen));
+
+    // QoS > 0: skip success CQE - send_desc freed by FSM (PUBACK/PUBCOMP) instead of CQE handler.
+    // Errors still generate CQEs for cleanup. This eliminates ~1000 CQEs per publish at fan-out 1000.
+    if (sd->sub_qos > 0) {
+        sqe->flags |= IOSQE_CQE_SKIP_SUCCESS;
+    }
     return true;
 }
 
@@ -328,6 +340,7 @@ INLINE bool submit_send_inf(struct broker *b, struct client_slot *c,
     u32 slot_idx = (u32)(c - b->clients);
     ring_prep_send(sqe, c->fd, cold->resp_pkt, 4, 0);
     sqe->user_data = make_user_data(OP_SEND_INF, (u32)c->fd, slot_idx);
+    sqe->flags |= IOSQE_CQE_SKIP_SUCCESS;
     // No flush - batched with other SQEs, flushed at end of event loop
     return true;
 }
@@ -587,13 +600,16 @@ INLINE void handle_send(struct broker *b, struct io_uring_cqe *cqe) {
 
 // Handle completion of zero-copy send
 // Cleanup: free send_desc, decrement msg refcount, free stolen buffer if last ref
+// NOTE: With CQE_SKIP_SUCCESS on QoS > 0 sends, this handler only runs on errors.
+// Success sends have their send_desc freed by the FSM (PUBACK/PUBCOMP handlers).
 INLINE void handle_send_zc(struct broker *b, struct io_uring_cqe *cqe) {
-    u32 send_desc_idx = ud_ctx(cqe->user_data);
+    u32 ctx           = ud_ctx(cqe->user_data);
+    u32 send_desc_idx = SD_CTX_IDX(ctx);
+    u8 expected_gen   = SD_CTX_GEN(ctx);
 
     struct send_desc *sd = send_desc_pool_get(&b->send_desc_pool, send_desc_idx);
-    if (unlikely(!sd)) {
-        log_error("handle_send_zc: invalid send_desc_idx %u", send_desc_idx);
-        return;
+    if (unlikely(!sd || sd->state == SEND_FREE || sd->alloc_gen != expected_gen)) {
+        return; // Stale CQE: send_desc was freed (disconnect cleanup) and possibly reused
     }
 
     if (unlikely(cqe->res < 0)) {

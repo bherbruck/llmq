@@ -200,7 +200,7 @@ struct send_desc {
     u8 header_len;       // Actual header length (3-7 bytes)
     u8 pkt_id_be[2];     // Big-endian packet_id for iovec
     u8 slot_gen;         // Client generation when send was submitted (stale detection)
-    u8 _pad;
+    u8 alloc_gen;        // Allocation generation for stale CQE detection (incremented on alloc)
     u32 cursor;          // For partial send resume (bytes sent so far)
     struct iovec iov[4]; // [header][topic][packet_id][payload]
 };
@@ -342,6 +342,7 @@ INLINE u32 send_desc_pool_alloc(struct send_desc_pool *p) {
     sd->state            = SEND_PENDING;
     sd->cursor           = 0;
     sd->msg_idx          = MSG_POOL_INVALID;
+    sd->alloc_gen++;
     return idx;
 }
 

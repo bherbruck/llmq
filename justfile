@@ -115,9 +115,9 @@ stop:
     -pkill -9 -x broker
 
 # Run the broker
-# Examples: just run, just run debug
-run type="release": stop (build type)
-    {{ out }}
+# Examples: just run, just run debug, just run debug --max-inflight 256
+run type="release" *args="": stop (build type)
+    {{ out }} {{ args }}
 
 # Run with strace to see syscalls
 strace: stop (build "debug")
