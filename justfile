@@ -109,12 +109,18 @@ compile-commands: _bindir
 
 # === Running ===
 
-# Run the broker (type: release, debug, profile, profile-inline)
-run type="release": (build type)
+# Stop any running broker instance
+stop:
+    -pkill -x broker
+    -pkill -9 -x broker
+
+# Run the broker
+# Examples: just run, just run debug
+run type="release": stop (build type)
     {{ out }}
 
 # Run with strace to see syscalls
-strace: (build "debug")
+strace: stop (build "debug")
     strace -f -e trace=io_uring_setup,io_uring_enter,io_uring_register {{ out }}
 
 # === Profiling ===

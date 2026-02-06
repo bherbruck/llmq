@@ -17,10 +17,10 @@ TEST(inflight_alloc_qos1) {
     ASSERT(idx >= 0);
     ASSERT(packet_id > 0);
     ASSERT(c.inflight_count == 1);
-    ASSERT(c.inflight[idx].state == INFLIGHT_WAIT_PUBACK);
-    ASSERT(c.inflight[idx].qos == 1);
-    ASSERT(c.inflight[idx].direction == 0); // outgoing
-    ASSERT(c.inflight[idx].send_desc_idx == SEND_DESC_INVALID);
+    ASSERT(c.inflight_hot[idx].state == INFLIGHT_WAIT_PUBACK);
+    ASSERT(c.inflight_cold[idx].qos == 1);
+    ASSERT(c.inflight_hot[idx].direction == 0); // outgoing
+    ASSERT(c.inflight_cold[idx].send_desc_idx == SEND_DESC_INVALID);
 
     client_inflight_free_all(&c);
 }
@@ -35,8 +35,8 @@ TEST(inflight_alloc_qos2) {
     ASSERT(idx >= 0);
     ASSERT(packet_id > 0);
     ASSERT(c.inflight_count == 1);
-    ASSERT(c.inflight[idx].state == INFLIGHT_WAIT_PUBREC);
-    ASSERT(c.inflight[idx].qos == 2);
+    ASSERT(c.inflight_hot[idx].state == INFLIGHT_WAIT_PUBREC);
+    ASSERT(c.inflight_cold[idx].qos == 2);
 
     client_inflight_free_all(&c);
 }
@@ -91,13 +91,13 @@ TEST(inflight_find) {
     u16 packet_id;
     client_inflight_alloc(&c, 1, MSG_POOL_INVALID, 0, &packet_id);
 
-    struct inflight_msg *found = client_inflight_find(&c, packet_id);
-    ASSERT(found != NULL);
-    ASSERT(found->packet_id == packet_id);
+    i32 slot = client_inflight_find(&c, packet_id);
+    ASSERT(slot >= 0);
+    ASSERT(c.inflight_hot[slot].packet_id == packet_id);
 
     // Non-existent packet ID
-    struct inflight_msg *not_found = client_inflight_find(&c, 9999);
-    ASSERT(not_found == NULL);
+    i32 not_found = client_inflight_find(&c, 9999);
+    ASSERT(not_found < 0);
 
     client_inflight_free_all(&c);
 }
@@ -110,15 +110,15 @@ TEST(inflight_free) {
     client_inflight_alloc(&c, 1, MSG_POOL_INVALID, 0, &packet_id);
     ASSERT(c.inflight_count == 1);
 
-    struct inflight_msg *msg = client_inflight_find(&c, packet_id);
-    client_inflight_free(&c, msg);
+    i32 slot = client_inflight_find(&c, packet_id);
+    client_inflight_free_slot(&c, (u16)slot);
 
     ASSERT(c.inflight_count == 0);
-    ASSERT(msg->state == INFLIGHT_FREE);
+    ASSERT(c.inflight_hot[slot].state == INFLIGHT_FREE);
 
     // Should not find it anymore
-    struct inflight_msg *not_found = client_inflight_find(&c, packet_id);
-    ASSERT(not_found == NULL);
+    i32 not_found = client_inflight_find(&c, packet_id);
+    ASSERT(not_found < 0);
 }
 
 TEST(inflight_reuse_after_free) {
@@ -128,8 +128,8 @@ TEST(inflight_reuse_after_free) {
     // Allocate and free
     u16 packet_id1;
     client_inflight_alloc(&c, 1, MSG_POOL_INVALID, 0, &packet_id1);
-    struct inflight_msg *msg = client_inflight_find(&c, packet_id1);
-    client_inflight_free(&c, msg);
+    i32 slot = client_inflight_find(&c, packet_id1);
+    client_inflight_free_slot(&c, (u16)slot);
 
     // Should be able to allocate again
     u16 packet_id2;
@@ -152,10 +152,10 @@ TEST(inflight_track_incoming) {
 
     ASSERT(idx >= 0);
     ASSERT(c.inflight_count == 1);
-    ASSERT(c.inflight[idx].packet_id == 42);
-    ASSERT(c.inflight[idx].state == INFLIGHT_WAIT_PUBREL);
-    ASSERT(c.inflight[idx].direction == 1); // incoming
-    ASSERT(c.inflight[idx].qos == 2);
+    ASSERT(c.inflight_hot[idx].packet_id == 42);
+    ASSERT(c.inflight_hot[idx].state == INFLIGHT_WAIT_PUBREL);
+    ASSERT(c.inflight_hot[idx].direction == 1); // incoming
+    ASSERT(c.inflight_cold[idx].qos == 2);
 
     client_inflight_free_all(&c);
 }
@@ -186,12 +186,12 @@ TEST(qos1_state_transition) {
     // Allocate QoS 1 - starts in WAIT_PUBACK
     u16 packet_id;
     client_inflight_alloc(&c, 1, MSG_POOL_INVALID, 0, &packet_id);
-    struct inflight_msg *msg = client_inflight_find(&c, packet_id);
+    i32 slot = client_inflight_find(&c, packet_id);
 
-    ASSERT(msg->state == INFLIGHT_WAIT_PUBACK);
+    ASSERT(c.inflight_hot[slot].state == INFLIGHT_WAIT_PUBACK);
 
     // Simulate PUBACK received - free the entry
-    client_inflight_free(&c, msg);
+    client_inflight_free_slot(&c, (u16)slot);
     ASSERT(c.inflight_count == 0);
 }
 
@@ -202,16 +202,16 @@ TEST(qos2_outgoing_state_transitions) {
     // Allocate QoS 2 outgoing - starts in WAIT_PUBREC
     u16 packet_id;
     client_inflight_alloc(&c, 2, MSG_POOL_INVALID, 0, &packet_id);
-    struct inflight_msg *msg = client_inflight_find(&c, packet_id);
+    i32 slot = client_inflight_find(&c, packet_id);
 
-    ASSERT(msg->state == INFLIGHT_WAIT_PUBREC);
+    ASSERT(c.inflight_hot[slot].state == INFLIGHT_WAIT_PUBREC);
 
     // Simulate PUBREC received - transition to WAIT_PUBCOMP
-    msg->state = INFLIGHT_WAIT_PUBCOMP;
-    ASSERT(msg->state == INFLIGHT_WAIT_PUBCOMP);
+    c.inflight_hot[slot].state = INFLIGHT_WAIT_PUBCOMP;
+    ASSERT(c.inflight_hot[slot].state == INFLIGHT_WAIT_PUBCOMP);
 
     // Simulate PUBCOMP received - free the entry
-    client_inflight_free(&c, msg);
+    client_inflight_free_slot(&c, (u16)slot);
     ASSERT(c.inflight_count == 0);
 }
 
@@ -221,12 +221,78 @@ TEST(qos2_incoming_state_transitions) {
 
     // Track incoming QoS 2 - starts in WAIT_PUBREL
     client_inflight_track_incoming(&c, 100, 0);
-    struct inflight_msg *msg = client_inflight_find(&c, 100);
+    i32 slot = client_inflight_find(&c, 100);
 
-    ASSERT(msg->state == INFLIGHT_WAIT_PUBREL);
-    ASSERT(msg->direction == 1);
+    ASSERT(c.inflight_hot[slot].state == INFLIGHT_WAIT_PUBREL);
+    ASSERT(c.inflight_hot[slot].direction == 1);
 
     // Simulate PUBREL received - free the entry (after sending PUBCOMP)
-    client_inflight_free(&c, msg);
+    client_inflight_free_slot(&c, (u16)slot);
     ASSERT(c.inflight_count == 0);
+}
+
+// =============================================================================
+// Hash Table Backward-Shift Deletion Tests
+// =============================================================================
+
+TEST(inflight_hash_remove_preserves_chain) {
+    struct client_slot c;
+    client_init(&c, 10, BUF_POOL_INVALID, LLMQ_MAX_INFLIGHT);
+
+    // Insert two incoming QoS 2 messages that hash to the same bucket.
+    // INFLIGHT_HASH_MASK = 511, so packet_ids that differ by 512 collide.
+    u16 id_a = 100;
+    u16 id_b = 100 + INFLIGHT_HASH_SIZE; // Same hash bucket as id_a
+
+    i32 slot_a = client_inflight_track_incoming(&c, id_a, 0);
+    i32 slot_b = client_inflight_track_incoming(&c, id_b, 0);
+    ASSERT(slot_a >= 0);
+    ASSERT(slot_b >= 0);
+    ASSERT(c.inflight_count == 2);
+
+    // Both should be findable via hash table
+    ASSERT(client_inflight_find(&c, id_a) >= 0);
+    ASSERT(client_inflight_find(&c, id_b) >= 0);
+
+    // Remove the FIRST entry (id_a) - backward-shift should preserve id_b's chain
+    client_inflight_free_slot(&c, (u16)slot_a);
+    ASSERT(c.inflight_count == 1);
+
+    // id_b must still be findable (this fails with naive EMPTY marking)
+    i32 found_b = client_inflight_find(&c, id_b);
+    ASSERT(found_b >= 0);
+    ASSERT(c.inflight_hot[found_b].packet_id == id_b);
+
+    client_inflight_free_all(&c);
+}
+
+TEST(inflight_hash_remove_triple_collision) {
+    struct client_slot c;
+    client_init(&c, 10, BUF_POOL_INVALID, LLMQ_MAX_INFLIGHT);
+
+    // Three colliding packet_ids
+    u16 id_a = 50;
+    u16 id_b = 50 + INFLIGHT_HASH_SIZE;
+    u16 id_c = 50 + INFLIGHT_HASH_SIZE * 2;
+
+    i32 slot_a = client_inflight_track_incoming(&c, id_a, 0);
+    i32 slot_b = client_inflight_track_incoming(&c, id_b, 0);
+    i32 slot_c = client_inflight_track_incoming(&c, id_c, 0);
+    ASSERT(slot_a >= 0 && slot_b >= 0 && slot_c >= 0);
+    ASSERT(c.inflight_count == 3);
+
+    // Remove middle entry (id_b) - chain must stay intact
+    client_inflight_free_slot(&c, (u16)slot_b);
+    ASSERT(c.inflight_count == 2);
+
+    ASSERT(client_inflight_find(&c, id_a) >= 0);
+    ASSERT(client_inflight_find(&c, id_c) >= 0);
+    ASSERT(client_inflight_find(&c, id_b) < 0); // Should be gone
+
+    // Remove first entry (id_a) - id_c must survive
+    client_inflight_free_slot(&c, (u16)slot_a);
+    ASSERT(c.inflight_count == 1);
+    ASSERT(client_inflight_find(&c, id_c) >= 0);
+
+    client_inflight_free_all(&c);
 }

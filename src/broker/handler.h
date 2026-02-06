@@ -21,7 +21,7 @@ INLINE bool send_static(struct broker *b, struct client_slot *c, const void *buf
 INLINE bool send_resp(struct broker *b, struct client_slot *c, const u8 *hdr, u16 packet_id);
 INLINE bool send_buf(struct broker *b, struct client_slot *c, const void *buf, u32 len);
 INLINE bool submit_send_inf(struct broker *b, struct client_slot *c,
-                            struct inflight_msg *inf, const u8 *hdr);
+                            u16 inf_slot, const u8 *hdr);
 INLINE void release_msg_ref(struct broker *b, u32 msg_idx);
 
 // Static headers for zero-copy protocol responses (type<<4 | flags, remaining_len)
@@ -132,6 +132,10 @@ static i32 forward_publish_zc(struct broker *b, u32 slot_idx, struct client_slot
 }
 
 // Process collected trie matches - no callback overhead, fully inlined
+// SQEs are batched during fan-out, flushed once by caller after return.
+// IMPORTANT: No io_uring_enter during fan-out. With COOP_TASKRUN, intermediate
+// submits create a feedback loop (completed recvs generate new CQEs that keep
+// the event loop spinning without progress).
 INLINE void process_publish_matches(struct broker *b, struct publish_ctx *pctx,
                                     struct trie_match_result *matches) {
     // Pre-fetch message once for all nodes (not per-callback)
@@ -175,23 +179,19 @@ INLINE void process_publish_matches(struct broker *b, struct publish_ctx *pctx,
 // MQTT Packet Processing
 // =============================================================================
 
-// Process a complete MQTT packet
+// Process a complete MQTT packet with pre-parsed header (avoids re-parsing)
 // Returns: bytes consumed, or -1 on error (close connection)
-INLINE i32 process_mqtt_packet(struct broker *b, struct client_slot *c, const u8 *buf, u32 len) {
-    struct mqtt_fixed_header hdr;
-    i32 hdr_len = mqtt_parse_fixed_header(buf, len, &hdr);
-    if (hdr_len < 0) {
-        return hdr_len;
-    }
-
-    u32 total_len     = (u32)hdr_len + hdr.remaining_len;
-    const u8 *var_hdr = buf + hdr_len;
-    u32 var_len       = hdr.remaining_len;
+INLINE i32 process_mqtt_packet_ex(struct broker *b, struct client_slot *c, const u8 *buf,
+                                   u32 len, const struct mqtt_fixed_header *hdr) {
+    (void)len; // Length already validated by mqtt_packet_complete_ex
+    u32 total_len     = hdr->header_len + hdr->remaining_len;
+    const u8 *var_hdr = buf + hdr->header_len;
+    u32 var_len       = hdr->remaining_len;
 
     // Get slot index for this client
     i32 slot_idx = b->fd_to_slot[c->fd];
 
-    switch (hdr.type) {
+    switch (hdr->type) {
     case MQTT_CONNECT: {
         if (c->state != CLIENT_ACTIVE || c->protocol_version != 0) {
             return -1;
@@ -341,7 +341,7 @@ INLINE i32 process_mqtt_packet(struct broker *b, struct client_slot *c, const u8
         }
 
         struct mqtt_publish pub_pkt;
-        i32 rc = mqtt_parse_publish(hdr.flags, var_hdr, var_len, &pub_pkt);
+        i32 rc = mqtt_parse_publish(hdr->flags, var_hdr, var_len, &pub_pkt);
         if (rc < 0) {
             return -1;
         }
@@ -442,11 +442,21 @@ INLINE i32 process_mqtt_packet(struct broker *b, struct client_slot *c, const u8
     }
 
     default:
-        log_warn("Unknown packet type=%d", hdr.type);
+        log_warn("Unknown packet type=%d", hdr->type);
         return -1;
     }
 
     return (i32)total_len;
+}
+
+// Wrapper for backwards compatibility (parses header internally)
+INLINE i32 process_mqtt_packet(struct broker *b, struct client_slot *c, const u8 *buf, u32 len) {
+    struct mqtt_fixed_header hdr;
+    i32 hdr_len = mqtt_parse_fixed_header(buf, len, &hdr);
+    if (hdr_len < 0) {
+        return hdr_len;
+    }
+    return process_mqtt_packet_ex(b, c, buf, len, &hdr);
 }
 
 #endif // BROKER_HANDLER_H

@@ -39,6 +39,14 @@ struct broker {
     u32 recv_retry_tail;
     u32 recv_retry_capacity;
 
+    // Send retry queue (for SQ-full recovery during fan-out)
+    // Circular buffer of (fd, send_desc_idx) pairs
+    u64 *send_retry_queue;  // Packed: (fd << 32) | send_desc_idx
+    u32 send_retry_head;
+    u32 send_retry_tail;
+    u32 send_retry_capacity;
+
+
     // fd → slot index mapping (mmap'd)
     i32 *fd_to_slot;
 
@@ -62,6 +70,9 @@ struct broker {
     u64 now;           // Current monotonic time in ms (updated each event loop iteration)
     u64 last_timeout_sweep; // Last time we swept for expired inflight entries
 
+    // Accept tracking
+    u32 accept_pending;           // Number of accept SQEs in flight
+
     // Stats
     u64 accepts;
     u64 bytes_recv;
@@ -76,6 +87,7 @@ struct broker {
     u64 drops_resp_full;          // Protocol response dropped (resp_slots busy)
     u64 stolen_buffers;           // Count of recv buffers stolen for fan-out
     u64 recv_retries;             // Count of recv submissions retried from SQ-full
+    u64 send_retries;             // Count of send submissions retried from SQ-full
 };
 
 // =============================================================================
@@ -91,14 +103,27 @@ INLINE i32 broker_init(struct broker *b, u32 max_clients, u32 max_fds, u16 max_i
     b->active_count  = 0;
     b->dormant_count = 0;
 
-    // Initialize recv retry queue (sized to max_clients - worst case all need retry)
-    b->recv_retry_capacity = max_clients;
+    // Initialize recv retry queue (sized to max_clients + 1 because circular buffer
+    // full detection wastes one slot: (tail+1)%cap == head)
+    b->recv_retry_capacity = max_clients + 1;
     b->recv_retry_head     = 0;
     b->recv_retry_tail     = 0;
-    usize retry_size       = (usize)max_clients * sizeof(u32);
-    b->recv_retry_queue    = (u32 *)sys_mmap(NULL, retry_size, PROT_READ | PROT_WRITE,
+    usize recv_recv_retry_size  = (usize)b->recv_retry_capacity * sizeof(u32);
+    b->recv_retry_queue    = (u32 *)sys_mmap(NULL, recv_recv_retry_size, PROT_READ | PROT_WRITE,
                                               MAP_PRIVATE | MAP_ANON, -1, 0);
     if (IS_ERR(b->recv_retry_queue)) {
+        return -1;
+    }
+
+    // Initialize send retry queue (sized for burst fan-out - max_clients * 16 sends)
+    b->send_retry_capacity = max_clients * 16;
+    b->send_retry_head     = 0;
+    b->send_retry_tail     = 0;
+    usize send_recv_retry_size  = (usize)b->send_retry_capacity * sizeof(u64);
+    b->send_retry_queue    = (u64 *)sys_mmap(NULL, send_recv_retry_size, PROT_READ | PROT_WRITE,
+                                              MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (IS_ERR(b->send_retry_queue)) {
+        sys_munmap(b->recv_retry_queue, recv_recv_retry_size);
         return -1;
     }
 
@@ -106,22 +131,25 @@ INLINE i32 broker_init(struct broker *b, u32 max_clients, u32 max_fds, u16 max_i
 
     // Recv pool: one buffer per potential active client
     if (buf_pool_init(&b->recv_pool, max_clients, recv_buf_size) < 0) {
-        sys_munmap(b->recv_retry_queue, retry_size);
+        sys_munmap(b->send_retry_queue, b->send_retry_capacity * sizeof(u64));
+        sys_munmap(b->recv_retry_queue, b->recv_retry_capacity * sizeof(u32));
         return -1;
     }
 
     // Message pool: canonical message metadata for zero-copy fan-out
     if (msg_pool_init(&b->msg_pool, msg_pool_size) < 0) {
-        sys_munmap(b->recv_retry_queue, retry_size);
         buf_pool_cleanup(&b->recv_pool);
+        sys_munmap(b->send_retry_queue, b->send_retry_capacity * sizeof(u64));
+        sys_munmap(b->recv_retry_queue, b->recv_retry_capacity * sizeof(u32));
         return -1;
     }
 
     // Send descriptor pool: ephemeral send state for active sends (dynamic growth)
     if (send_desc_pool_init(&b->send_desc_pool, send_desc_initial, send_desc_max) < 0) {
-        sys_munmap(b->recv_retry_queue, retry_size);
-        buf_pool_cleanup(&b->recv_pool);
         msg_pool_cleanup(&b->msg_pool);
+        buf_pool_cleanup(&b->recv_pool);
+        sys_munmap(b->send_retry_queue, b->send_retry_capacity * sizeof(u64));
+        sys_munmap(b->recv_retry_queue, b->recv_retry_capacity * sizeof(u32));
         return -1;
     }
 
@@ -130,10 +158,11 @@ INLINE i32 broker_init(struct broker *b, u32 max_clients, u32 max_fds, u16 max_i
     b->clients         = (struct client_slot *)sys_mmap(NULL, clients_size, PROT_READ | PROT_WRITE,
                                                         MAP_PRIVATE | MAP_ANON, -1, 0);
     if (IS_ERR(b->clients)) {
-        sys_munmap(b->recv_retry_queue, retry_size);
-        buf_pool_cleanup(&b->recv_pool);
-        msg_pool_cleanup(&b->msg_pool);
         send_desc_pool_cleanup(&b->send_desc_pool);
+        msg_pool_cleanup(&b->msg_pool);
+        buf_pool_cleanup(&b->recv_pool);
+        sys_munmap(b->send_retry_queue, b->send_retry_capacity * sizeof(u64));
+        sys_munmap(b->recv_retry_queue, b->recv_retry_capacity * sizeof(u32));
         return -1;
     }
 
@@ -143,10 +172,11 @@ INLINE i32 broker_init(struct broker *b, u32 max_clients, u32 max_fds, u16 max_i
         (i32 *)sys_mmap(NULL, fd_map_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
     if (IS_ERR(b->fd_to_slot)) {
         sys_munmap(b->clients, clients_size);
-        sys_munmap(b->recv_retry_queue, retry_size);
-        buf_pool_cleanup(&b->recv_pool);
-        msg_pool_cleanup(&b->msg_pool);
         send_desc_pool_cleanup(&b->send_desc_pool);
+        msg_pool_cleanup(&b->msg_pool);
+        buf_pool_cleanup(&b->recv_pool);
+        sys_munmap(b->send_retry_queue, b->send_retry_capacity * sizeof(u64));
+        sys_munmap(b->recv_retry_queue, b->recv_retry_capacity * sizeof(u32));
         return -1;
     }
 
@@ -174,7 +204,8 @@ INLINE i32 broker_init(struct broker *b, u32 max_clients, u32 max_fds, u16 max_i
     if (hashmap_init(&b->client_map, max_clients * 2) < 0) {
         sys_munmap(b->fd_to_slot, fd_map_size);
         sys_munmap(b->clients, clients_size);
-        sys_munmap(b->recv_retry_queue, retry_size);
+        sys_munmap(b->send_retry_queue, b->send_retry_capacity * sizeof(u64));
+        sys_munmap(b->recv_retry_queue, b->recv_retry_capacity * sizeof(u32));
         buf_pool_cleanup(&b->recv_pool);
         msg_pool_cleanup(&b->msg_pool);
         send_desc_pool_cleanup(&b->send_desc_pool);
@@ -206,6 +237,9 @@ INLINE void broker_cleanup(struct broker *b) {
     }
     if (b->recv_retry_queue) {
         sys_munmap(b->recv_retry_queue, b->recv_retry_capacity * sizeof(u32));
+    }
+    if (b->send_retry_queue) {
+        sys_munmap(b->send_retry_queue, b->send_retry_capacity * sizeof(u64));
     }
     buf_pool_cleanup(&b->recv_pool);
     msg_pool_cleanup(&b->msg_pool);
@@ -245,6 +279,49 @@ INLINE u32 recv_retry_dequeue(struct broker *b) {
     u32 slot_idx       = b->recv_retry_queue[b->recv_retry_head];
     b->recv_retry_head = (b->recv_retry_head + 1) % b->recv_retry_capacity;
     return slot_idx;
+}
+
+// =============================================================================
+// Send Retry Queue (for SQ-full recovery during fan-out)
+// Stores (fd, send_desc_idx) pairs - NO data copy, just indices
+// =============================================================================
+
+// Pack fd and send_desc_idx into u64
+#define SEND_RETRY_PACK(fd, sd_idx) (((u64)(fd) << 32) | (u64)(sd_idx))
+#define SEND_RETRY_FD(packed)       ((i32)((packed) >> 32))
+#define SEND_RETRY_SD_IDX(packed)   ((u32)((packed) & 0xFFFFFFFF))
+
+// Check if send retry queue is empty
+INLINE bool send_retry_empty(struct broker *b) {
+    return b->send_retry_head == b->send_retry_tail;
+}
+
+// Check if send retry queue is full
+INLINE bool send_retry_full(struct broker *b) {
+    u32 next = (b->send_retry_tail + 1) % b->send_retry_capacity;
+    return next == b->send_retry_head;
+}
+
+// Enqueue (fd, send_desc_idx) for send retry
+// Returns true if enqueued, false if queue full
+INLINE bool send_retry_enqueue(struct broker *b, i32 fd, u32 send_desc_idx) {
+    if (send_retry_full(b)) {
+        return false;
+    }
+    b->send_retry_queue[b->send_retry_tail] = SEND_RETRY_PACK(fd, send_desc_idx);
+    b->send_retry_tail = (b->send_retry_tail + 1) % b->send_retry_capacity;
+    return true;
+}
+
+// Dequeue (fd, send_desc_idx) for send retry
+// Returns packed value, or 0 if empty (check with send_retry_empty first)
+INLINE u64 send_retry_dequeue(struct broker *b) {
+    if (send_retry_empty(b)) {
+        return 0;
+    }
+    u64 packed         = b->send_retry_queue[b->send_retry_head];
+    b->send_retry_head = (b->send_retry_head + 1) % b->send_retry_capacity;
+    return packed;
 }
 
 // =============================================================================
@@ -432,12 +509,13 @@ INLINE void broker_slot_resume(struct broker *b, u32 slot_idx, i32 fd) {
 // =============================================================================
 
 enum op_type {
-    OP_ACCEPT   = 1,
-    OP_RECV     = 2,
-    OP_SEND     = 3,
-    OP_CLOSE    = 4,
-    OP_SEND_ZC  = 5, // Zero-copy send: context = send_desc index
-    OP_SEND_INF = 6, // Send from inflight entry: context = slot_idx, buffer is inflight.resp_pkt
+    OP_ACCEPT    = 1,
+    OP_RECV      = 2,
+    OP_SEND      = 3,
+    OP_CLOSE     = 4,
+    OP_SEND_ZC   = 5, // Zero-copy send: context = send_desc index
+    OP_SEND_INF  = 6, // Send from inflight entry: context = slot_idx, buffer is inflight.resp_pkt
+    OP_SEND_RESP = 7, // Protocol response from resp_buf: context = (slot_idx << 8) | resp_slot
 };
 
 // Pack: [8-bit op][24-bit fd][32-bit context]

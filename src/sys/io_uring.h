@@ -201,12 +201,10 @@ struct io_uring_params {
 
 struct ring {
     i32 fd;
-    bool sqpoll; // Using SQPOLL mode
 
     // Submission queue
     u32 *sq_head;
     u32 *sq_tail;
-    u32 *sq_flags; // For SQPOLL: check IORING_SQ_NEED_WAKEUP
     u32 *sq_array;
     u32 sq_mask;
     u32 sq_entries;
@@ -244,9 +242,7 @@ struct ring {
 // =============================================================================
 
 // Initialize the ring (returns 0 on success, -errno on failure)
-// Initialize ring. If use_sqpoll is true, kernel thread polls SQ (no syscalls for submit).
-// sq_thread_idle_ms: milliseconds before SQPOLL thread goes idle (0 = kernel default ~1000ms)
-i32 ring_init(struct ring *r, u32 entries, bool use_sqpoll, u32 sq_thread_idle_ms);
+i32 ring_init(struct ring *r, u32 entries);
 
 // Cleanup the ring
 void ring_cleanup(struct ring *r);
@@ -297,39 +293,11 @@ INLINE u32 ring_sq_pending(struct ring *r) {
     return r->sq_tail_local - io_uring_smp_load_acquire(r->sq_head);
 }
 
-// Check if SQPOLL kernel thread needs wakeup
-INLINE bool ring_sq_need_wakeup(struct ring *r) {
-    if (!r->sqpoll || !r->sq_flags) {
-        return false;
-    }
-    return (io_uring_smp_load_acquire(r->sq_flags) & IORING_SQ_NEED_WAKEUP) != 0;
-}
-
 // Submit pending SQEs and optionally wait for completions
-// With SQPOLL: kernel polls SQ, only syscall needed for wakeup or waiting
-// Without SQPOLL: syscall needed for every submit
 INLINE i32 ring_submit(struct ring *r, u32 wait_nr) {
     u32 submitted = ring_sq_pending(r);
-
-    if (r->sqpoll) {
-        // SQPOLL: kernel thread picks up SQEs automatically
-        // Only syscall if we need to wake it up or wait for completions
-        u32 flags = 0;
-        if (ring_sq_need_wakeup(r)) {
-            flags |= IORING_ENTER_SQ_WAKEUP;
-        }
-        if (wait_nr > 0) {
-            flags |= IORING_ENTER_GETEVENTS;
-        }
-        if (flags == 0) {
-            return (i32)submitted; // No syscall needed
-        }
-        return sys_io_uring_enter(r->fd, 0, wait_nr, flags, NULL);
-    }
-
-    // Non-SQPOLL: must syscall to submit
     if (submitted == 0 && wait_nr == 0) {
-        return 0; // Nothing to do
+        return 0;
     }
     u32 flags = wait_nr ? IORING_ENTER_GETEVENTS : 0;
     return sys_io_uring_enter(r->fd, submitted, wait_nr, flags, NULL);
@@ -338,11 +306,7 @@ INLINE i32 ring_submit(struct ring *r, u32 wait_nr) {
 // Submit and wait for at least min_complete CQEs
 INLINE i32 ring_submit_and_wait(struct ring *r, u32 min_complete) {
     u32 submitted = ring_sq_pending(r);
-    u32 flags     = IORING_ENTER_GETEVENTS;
-    if (r->sqpoll && ring_sq_need_wakeup(r)) {
-        flags |= IORING_ENTER_SQ_WAKEUP;
-    }
-    return sys_io_uring_enter(r->fd, r->sqpoll ? 0 : submitted, min_complete, flags, NULL);
+    return sys_io_uring_enter(r->fd, submitted, min_complete, IORING_ENTER_GETEVENTS, NULL);
 }
 
 // Sync local head/tail with kernel (call at start of CQE processing batch)

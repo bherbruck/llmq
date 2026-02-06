@@ -19,7 +19,7 @@
 #endif
 
 #ifndef LLMQ_LISTEN_BACKLOG
-#define LLMQ_LISTEN_BACKLOG 128 // listen() backlog
+#define LLMQ_LISTEN_BACKLOG 4096 // listen() backlog (handles connection bursts)
 #endif
 
 // =============================================================================

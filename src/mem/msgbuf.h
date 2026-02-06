@@ -16,19 +16,20 @@
 typedef volatile u32 atomic_u32;
 
 INLINE u32 atomic_load(atomic_u32 *a) {
-    return __atomic_load_n(a, __ATOMIC_ACQUIRE);
+    return *a;
 }
 
+// Single-threaded broker: use plain ops instead of atomics for ref counting.
 INLINE void atomic_store(atomic_u32 *a, u32 val) {
-    __atomic_store_n(a, val, __ATOMIC_RELEASE);
+    *a = val;
 }
 
 INLINE u32 atomic_inc(atomic_u32 *a) {
-    return __atomic_add_fetch(a, 1, __ATOMIC_ACQ_REL);
+    return ++(*a);
 }
 
 INLINE u32 atomic_dec(atomic_u32 *a) {
-    return __atomic_sub_fetch(a, 1, __ATOMIC_ACQ_REL);
+    return --(*a);
 }
 
 // =============================================================================

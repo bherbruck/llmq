@@ -187,8 +187,9 @@ INLINE i32 mqtt_parse_fixed_header(const u8 *buf, u32 len, struct mqtt_fixed_hea
     return (i32)pos;
 }
 
-// Check if we have a complete packet
-INLINE i32 mqtt_packet_complete(const u8 *buf, u32 len) {
+// Check if we have a complete packet, optionally returning parsed header
+// If out_hdr is non-NULL, fills it with the parsed header (avoids re-parsing later)
+INLINE i32 mqtt_packet_complete_ex(const u8 *buf, u32 len, struct mqtt_fixed_header *out_hdr) {
     struct mqtt_fixed_header hdr;
     i32 rc = mqtt_parse_fixed_header(buf, len, &hdr);
     if (unlikely(rc < 0)) {
@@ -200,7 +201,15 @@ INLINE i32 mqtt_packet_complete(const u8 *buf, u32 len) {
         return MQTT_INCOMPLETE;
     }
 
+    if (out_hdr) {
+        *out_hdr = hdr;
+    }
     return (i32)total;
+}
+
+// Check if we have a complete packet (convenience wrapper)
+INLINE i32 mqtt_packet_complete(const u8 *buf, u32 len) {
+    return mqtt_packet_complete_ex(buf, len, NULL);
 }
 
 // =============================================================================

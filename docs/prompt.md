@@ -144,7 +144,7 @@ This enforces liveness — client's right to hold memory expires, not the messag
 
 ### io_uring Usage
 
-Single ring, SQPOLL mode if targeting zero-syscall hot path.
+Single ring with COOP_TASKRUN + SINGLE_ISSUER. Batched submission amortizes syscall cost.
 
 ```
 Operations:
@@ -213,7 +213,6 @@ FSM states track where we are in the ceremony. Refcount released when ceremony c
 
 ```
 Syscalls per message at fan-out of N:
-  Target: 0 (with SQPOLL)
-  Acceptable: 1 (io_uring_enter for batch)
+  Target: 1 (io_uring_enter for batch, amortized across many ops)
   Bad: N (one per subscriber)
 ```

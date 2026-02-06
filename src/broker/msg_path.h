@@ -80,7 +80,7 @@ struct broker;
 //
 // Returns: send_desc index, or -1 on failure
 INLINE i32 msg_prepare_send(struct broker *b, u32 msg_idx, u16 packet_id,
-                            u8 sub_qos, u8 dup, u32 slot_idx, u16 slot_gen) {
+                            u8 sub_qos, u8 dup, u32 slot_idx, u8 slot_gen) {
     struct canonical_msg *msg = msg_pool_get(&b->msg_pool, msg_idx);
     if (unlikely(!msg)) {
         return -1;

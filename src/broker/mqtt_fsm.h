@@ -54,8 +54,8 @@ INLINE bool fsm_pub_received(struct broker *b, struct client_slot *pub,
 
     case 2: {
         // QoS 2: check for duplicate first
-        struct inflight_msg *existing = client_inflight_find(pub, packet_id);
-        if (existing && existing->direction == 1) {
+        i32 existing = client_inflight_find(pub, packet_id);
+        if (existing >= 0 && pub->inflight_hot[existing].direction == 1) {
             // Duplicate - resend PUBREC, don't fan-out again
             send_pubrec(b, pub, packet_id);
             return false;
@@ -81,9 +81,11 @@ INLINE bool fsm_pub_received(struct broker *b, struct client_slot *pub,
 // Completes the publisher ceremony.
 INLINE void fsm_pub_pubrel_received(struct broker *b, struct client_slot *pub,
                                     u16 packet_id) {
-    struct inflight_msg *inf = client_inflight_find(pub, packet_id);
-    if (inf && inf->state == INFLIGHT_WAIT_PUBREL && inf->direction == 1) {
-        client_inflight_free(pub, inf);
+    i32 slot = client_inflight_find(pub, packet_id);
+    if (slot >= 0 &&
+        pub->inflight_hot[slot].state == INFLIGHT_WAIT_PUBREL &&
+        pub->inflight_hot[slot].direction == 1) {
+        client_inflight_free_slot(pub, (u16)slot);
     }
     // Always send PUBCOMP even if we didn't find tracking (idempotent)
     send_pubcomp(b, pub, packet_id);
@@ -133,13 +135,13 @@ INLINE i32 fsm_sub_start_delivery(struct broker *b, struct client_slot *sub,
     if (unlikely(sd_idx < 0)) {
         // Failed to prepare - clean up
         release_msg_ref(b, msg_idx);
-        client_inflight_free(sub, &sub->inflight[inf_idx]);
+        client_inflight_free_slot(sub, (u16)inf_idx);
         b->drops_send_desc_empty++;
         return -1;
     }
 
     // Link send_desc to inflight for completion handling
-    sub->inflight[inf_idx].send_desc_idx = (u32)sd_idx;
+    sub->inflight_cold[inf_idx].send_desc_idx = (u32)sd_idx;
 
     // Submit to io_uring
     msg_submit(b, (u32)sd_idx, sub->fd);
@@ -150,45 +152,48 @@ INLINE i32 fsm_sub_start_delivery(struct broker *b, struct client_slot *sub,
 // Releases message reference and frees inflight entry.
 INLINE void fsm_sub_puback_received(struct broker *b, struct client_slot *sub,
                                     u16 packet_id) {
-    struct inflight_msg *inf = client_inflight_find(sub, packet_id);
-    if (!inf || inf->state != INFLIGHT_WAIT_PUBACK) {
+    // Direct lookup - we assigned this packet_id, no hash table needed
+    i32 slot = client_inflight_find_direct(sub, packet_id);
+    if (slot < 0 || sub->inflight_hot[slot].state != INFLIGHT_WAIT_PUBACK) {
         return; // Unexpected or duplicate - ignore
     }
 
     // Ceremony complete - release reference
-    release_msg_ref(b, inf->msg_idx);
-    client_inflight_free(sub, inf);
+    release_msg_ref(b, sub->inflight_hot[slot].msg_idx);
+    client_inflight_free_slot(sub, (u16)slot);
 }
 
 // Called when we receive PUBREC from subscriber (QoS 2 step 2).
 // Transitions to WAIT_PUBCOMP state, sends PUBREL.
 INLINE void fsm_sub_pubrec_received(struct broker *b, struct client_slot *sub,
                                     u16 packet_id) {
-    struct inflight_msg *inf = client_inflight_find(sub, packet_id);
-    if (!inf || inf->state != INFLIGHT_WAIT_PUBREC) {
+    // Direct lookup - we assigned this packet_id, no hash table needed
+    i32 slot = client_inflight_find_direct(sub, packet_id);
+    if (slot < 0 || sub->inflight_hot[slot].state != INFLIGHT_WAIT_PUBREC) {
         return; // Unexpected - ignore
     }
 
-    // Transition state
-    inf->state    = INFLIGHT_WAIT_PUBCOMP;
-    inf->deadline = b->now + LLMQ_INFLIGHT_TIMEOUT_MS;
+    // Transition state (hot write + cold write)
+    sub->inflight_hot[slot].state    = INFLIGHT_WAIT_PUBCOMP;
+    sub->inflight_cold[slot].deadline = b->now + LLMQ_INFLIGHT_TIMEOUT_MS;
 
     // Send PUBREL async (hot path - 1000s of these per message)
-    submit_send_inf(b, sub, inf, HDR_PUBREL);
+    submit_send_inf(b, sub, (u16)slot, HDR_PUBREL);
 }
 
 // Called when we receive PUBCOMP from subscriber (QoS 2 complete).
 // Releases message reference and frees inflight entry.
 INLINE void fsm_sub_pubcomp_received(struct broker *b, struct client_slot *sub,
                                      u16 packet_id) {
-    struct inflight_msg *inf = client_inflight_find(sub, packet_id);
-    if (!inf || inf->state != INFLIGHT_WAIT_PUBCOMP) {
+    // Direct lookup - we assigned this packet_id, no hash table needed
+    i32 slot = client_inflight_find_direct(sub, packet_id);
+    if (slot < 0 || sub->inflight_hot[slot].state != INFLIGHT_WAIT_PUBCOMP) {
         return; // Unexpected - ignore
     }
 
     // Ceremony complete - release reference
-    release_msg_ref(b, inf->msg_idx);
-    client_inflight_free(sub, inf);
+    release_msg_ref(b, sub->inflight_hot[slot].msg_idx);
+    client_inflight_free_slot(sub, (u16)slot);
 }
 
 // =============================================================================
@@ -198,41 +203,42 @@ INLINE void fsm_sub_pubcomp_received(struct broker *b, struct client_slot *sub,
 // Called when an inflight entry times out.
 // Either retries with DUP=1 or gives up and releases reference.
 INLINE void fsm_sub_timeout(struct broker *b, struct client_slot *sub,
-                            struct inflight_msg *inf, u32 slot_idx) {
-    (void)slot_idx; // Used only for PUBLISH retransmit
+                            u16 inf_slot, u32 client_slot_idx) {
+    struct inflight_hot *hot = &sub->inflight_hot[inf_slot];
+    struct inflight_cold *cold = &sub->inflight_cold[inf_slot];
 
     // Check if we should give up
-    if (inf->dup_count >= LLMQ_MAX_RETRIES) {
+    if (cold->dup_count >= LLMQ_MAX_RETRIES) {
         // Max retries reached - give up
-        release_msg_ref(b, inf->msg_idx);
-        client_inflight_free(sub, inf);
+        release_msg_ref(b, hot->msg_idx);
+        client_inflight_free_slot(sub, inf_slot);
         b->msgs_dropped++;
         return;
     }
 
     // Retry based on current state
-    inf->dup_count++;
-    inf->deadline = b->now + LLMQ_INFLIGHT_TIMEOUT_MS;
+    cold->dup_count++;
+    cold->deadline = b->now + LLMQ_INFLIGHT_TIMEOUT_MS;
 
-    if (inf->state == INFLIGHT_WAIT_PUBCOMP) {
+    if (hot->state == INFLIGHT_WAIT_PUBCOMP) {
         // QoS 2: Already received PUBREC, retransmit PUBREL (not PUBLISH)
-        send_pubrel(b, sub, inf->packet_id);
+        send_pubrel(b, sub, hot->packet_id);
         return;
     }
 
     // QoS 1 (WAIT_PUBACK) or QoS 2 (WAIT_PUBREC): retransmit PUBLISH with DUP=1
-    i32 sd_idx = msg_prepare_send(b, inf->msg_idx, inf->packet_id, inf->qos, 1,
-                                  slot_idx, sub->generation);
+    i32 sd_idx = msg_prepare_send(b, hot->msg_idx, hot->packet_id, cold->qos, 1,
+                                  client_slot_idx, sub->generation);
     if (unlikely(sd_idx < 0)) {
         // Can't retry - give up
-        release_msg_ref(b, inf->msg_idx);
-        client_inflight_free(sub, inf);
+        release_msg_ref(b, hot->msg_idx);
+        client_inflight_free_slot(sub, inf_slot);
         b->msgs_dropped++;
         return;
     }
 
     // Link and submit
-    inf->send_desc_idx = (u32)sd_idx;
+    cold->send_desc_idx = (u32)sd_idx;
     msg_submit(b, (u32)sd_idx, sub->fd);
 }
 
@@ -250,16 +256,16 @@ INLINE void fsm_client_disconnect(struct broker *b, struct client_slot *c) {
 
     u16 found = 0;
     for (u16 i = 0; i < c->max_inflight && found < c->inflight_count; i++) {
-        struct inflight_msg *inf = &c->inflight[i];
-        if (inf->state == INFLIGHT_FREE) {
+        struct inflight_hot *hot = &c->inflight_hot[i];
+        if (hot->state == INFLIGHT_FREE) {
             continue;
         }
         found++;
 
         // Only release refs for outgoing messages (direction=0)
         // Incoming QoS 2 tracking (direction=1) doesn't hold buffer refs
-        if (inf->direction == 0 && inf->msg_idx != MSG_POOL_INVALID) {
-            release_msg_ref(b, inf->msg_idx);
+        if (hot->direction == 0 && hot->msg_idx != MSG_POOL_INVALID) {
+            release_msg_ref(b, hot->msg_idx);
         }
     }
     // Note: inflight entries freed by broker_free_slot calling client_inflight_free_all
@@ -281,17 +287,18 @@ INLINE u32 fsm_sweep_client(struct broker *b, struct client_slot *c, u32 slot_id
     u16 found     = 0;
 
     for (u16 i = 0; i < c->max_inflight && found < c->inflight_count; i++) {
-        struct inflight_msg *inf = &c->inflight[i];
-        if (inf->state == INFLIGHT_FREE) {
+        struct inflight_hot *hot = &c->inflight_hot[i];
+        struct inflight_cold *cold = &c->inflight_cold[i];
+        if (hot->state == INFLIGHT_FREE) {
             continue;
         }
         found++;
 
         // Check deadline (0 = no timeout)
-        if (inf->deadline != 0 && b->now > inf->deadline) {
+        if (cold->deadline != 0 && b->now > cold->deadline) {
             // Only timeout outgoing messages (we sent PUBLISH, waiting for ACK)
-            if (inf->direction == 0) {
-                fsm_sub_timeout(b, c, inf, slot_idx);
+            if (hot->direction == 0) {
+                fsm_sub_timeout(b, c, i, slot_idx);
                 processed++;
             }
         }
@@ -305,8 +312,12 @@ INLINE u32 fsm_sweep_client(struct broker *b, struct client_slot *c, u32 slot_id
 INLINE u32 fsm_sweep_all_timeouts(struct broker *b) {
     u32 total = 0;
 
+    // Only sweep active clients with inflight messages (avoids function call overhead)
     for (u32 i = 0; i < b->max_clients; i++) {
-        total += fsm_sweep_client(b, &b->clients[i], i);
+        struct client_slot *c = &b->clients[i];
+        if (c->state == CLIENT_ACTIVE && c->inflight_count > 0) {
+            total += fsm_sweep_client(b, c, i);
+        }
     }
 
     return total;

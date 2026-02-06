@@ -8,34 +8,20 @@
 #define IORING_OFF_CQ_RING 0x8000000ULL
 #define IORING_OFF_SQES    0x10000000ULL
 
-i32 ring_init(struct ring *r, u32 entries, bool use_sqpoll, u32 sq_thread_idle_ms) {
+i32 ring_init(struct ring *r, u32 entries) {
     struct io_uring_params p;
     memset(&p, 0, sizeof(p));
 
-    // Request features for better performance
     // SINGLE_ISSUER: Only one task will submit - allows optimizations
-    p.flags = IORING_SETUP_SINGLE_ISSUER;
+    // COOP_TASKRUN: Completions delivered only during io_uring_enter (deterministic)
+    p.flags = IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_COOP_TASKRUN;
 
-    if (use_sqpoll) {
-        // SQPOLL: Kernel thread polls SQ, no syscalls needed for submission
-        p.flags |= IORING_SETUP_SQPOLL;
-        if (sq_thread_idle_ms > 0) {
-            p.sq_thread_idle = sq_thread_idle_ms;
-        }
-        // Note: SQPOLL requires root or CAP_SYS_NICE
-    } else {
-        // COOP_TASKRUN: Allow task work in any kernel context (lower latency)
-        p.flags |= IORING_SETUP_COOP_TASKRUN;
-    }
-
-    // Create the ring
     i32 fd = sys_io_uring_setup(entries, &p);
     if (fd < 0) {
         return fd;
     }
 
     r->fd         = fd;
-    r->sqpoll     = use_sqpoll;
     r->sq_entries = p.sq_entries;
     r->cq_entries = p.cq_entries;
 
@@ -56,7 +42,6 @@ i32 ring_init(struct ring *r, u32 entries, bool use_sqpoll, u32 sq_thread_idle_m
     u8 *sq_ptr  = (u8 *)r->sq_ring_ptr;
     r->sq_head  = (u32 *)(sq_ptr + p.sq_off.head);
     r->sq_tail  = (u32 *)(sq_ptr + p.sq_off.tail);
-    r->sq_flags = (u32 *)(sq_ptr + p.sq_off.flags); // For SQPOLL NEED_WAKEUP check
     r->sq_mask  = *(u32 *)(sq_ptr + p.sq_off.ring_mask);
     r->sq_array = (u32 *)(sq_ptr + p.sq_off.array);
 

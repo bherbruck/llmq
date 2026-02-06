@@ -23,6 +23,7 @@
 #define SYS_bind              49
 #define SYS_listen            50
 #define SYS_setsockopt        54
+#define SYS_shutdown          48
 
 // sendmsg flags
 #define MSG_DONTWAIT 0x40
@@ -205,6 +206,9 @@ INLINE i32 sys_munmap(void *addr, usize len) {
 #define SO_REUSEPORT 15
 #define IPPROTO_TCP  6
 #define TCP_NODELAY  1
+#define SHUT_RD      0
+#define SHUT_WR      1
+#define SHUT_RDWR    2
 
 INLINE i32 sys_socket(i32 domain, i32 type, i32 protocol) {
     return (i32)syscall3(SYS_socket, domain, type, protocol);
@@ -220,6 +224,10 @@ INLINE i32 sys_listen(i32 fd, i32 backlog) {
 
 INLINE i32 sys_setsockopt(i32 fd, i32 level, i32 optname, const void *optval, u32 optlen) {
     return (i32)syscall5(SYS_setsockopt, fd, level, optname, (i64)optval, optlen);
+}
+
+INLINE i32 sys_shutdown(i32 fd, i32 how) {
+    return (i32)syscall2(SYS_shutdown, fd, how);
 }
 
 // Signal handling

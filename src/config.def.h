@@ -29,9 +29,6 @@
     FIELD(limits, msg_pool_size, u32, 1024, "msg-pool-size", "Fan-out msg slots")\
     FIELD(limits, send_desc_mult, u8, 16, "send-desc-mult", "Send descs per conn")\
     FIELD(limits, send_desc_max_mb, u32, 1536, "send-desc-max", "Max send_desc MB")\
-    /* io_uring SQPOLL (requires root or CAP_SYS_NICE) */                        \
-    FIELD(uring, sqpoll, u8, 0, "sqpoll", "Enable SQPOLL (0/1)")                 \
-    FIELD(uring, sqpoll_idle_ms, u32, 10000, "sqpoll-idle", "SQPOLL idle timeout ms")\
     /* Per-client buffers */                                                     \
     FIELD(client, max_inflight, u16, 256, "max-inflight", "QoS inflight/client") \
     /* Debug */                                                                  \

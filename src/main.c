@@ -150,21 +150,15 @@ i32 broker_main(i32 argc, char **argv, char **envp) {
              client_mem / KB_DIVISOR, recv_mem / MB_DIVISOR, msg_mem / KB_DIVISOR,
              sd_initial_b / KB_DIVISOR, cfg.limits_send_desc_max_mb);
 
-    bool use_sqpoll = cfg.uring_sqpoll != 0;
-    log_info("Initializing io_uring with %d entries%s...", cfg.limits_ring_entries,
-             use_sqpoll ? " (SQPOLL)" : "");
+    log_info("Initializing io_uring with %d entries...", cfg.limits_ring_entries);
 
-    rc = ring_init(&b.ring, cfg.limits_ring_entries, use_sqpoll, cfg.uring_sqpoll_idle_ms);
+    rc = ring_init(&b.ring, cfg.limits_ring_entries);
     if (rc < 0) {
-        if (use_sqpoll && rc == -EPERM) {
-            log_error("SQPOLL requires root or CAP_SYS_NICE");
-        } else {
-            log_error("ring_init failed: %d", rc);
-        }
+        log_error("ring_init failed: %d", rc);
         broker_cleanup(&b);
         return 1;
     }
-    log_info("io_uring initialized%s", use_sqpoll ? " with kernel SQ polling" : "");
+    log_info("io_uring initialized");
 
     log_info("Binding to port %d...", cfg.network_port);
 
