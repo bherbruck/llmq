@@ -17,6 +17,7 @@
 #define SYS_writev            20
 #define SYS_mmap              9
 #define SYS_munmap            11
+#define SYS_mremap            25
 #define SYS_socket            41
 #define SYS_sendmsg           46
 #define SYS_accept            43
@@ -196,6 +197,12 @@ INLINE void *sys_mmap(void *addr, usize len, i32 prot, i32 flags, i32 fd, i64 of
 
 INLINE i32 sys_munmap(void *addr, usize len) {
     return (i32)syscall2(SYS_munmap, (i64)addr, (i64)len);
+}
+
+#define MREMAP_MAYMOVE 1
+
+INLINE void *sys_mremap(void *old_addr, usize old_size, usize new_size, i32 flags) {
+    return (void *)syscall4(SYS_mremap, (i64)old_addr, (i64)old_size, (i64)new_size, flags);
 }
 
 // Socket constants

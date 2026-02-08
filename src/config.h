@@ -62,12 +62,8 @@
 // Topic Trie (compile-time, affects struct layout)
 // =============================================================================
 
-#ifndef LLMQ_TRIE_MAX_NODES
-#define LLMQ_TRIE_MAX_NODES 1024
-#endif
-
-#ifndef LLMQ_TRIE_MAX_CHILDREN
-#define LLMQ_TRIE_MAX_CHILDREN 32
+#ifndef LLMQ_TRIE_INITIAL_NODES
+#define LLMQ_TRIE_INITIAL_NODES 256 // Starting capacity, grows via mremap
 #endif
 
 #ifndef LLMQ_TRIE_MAX_SEGMENT

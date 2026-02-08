@@ -1,26 +1,28 @@
 // broker/trie.h - Topic trie for subscription matching
 // O(1) child lookup via hash table, O(topic_levels) total lookup with wildcard support
+// Node pool is mmap'd and grows via mremap when exhausted.
 
 #ifndef BROKER_TRIE_H
 #define BROKER_TRIE_H
 
 #include "sys/types.h"
+#include "sys/syscall.h"
 #include "mem/string.h"
 #include "mqtt/packet.h"
 #include "config.h"
 
 // =============================================================================
-// Configuration (from config.h, with local aliases)
+// Configuration
 // =============================================================================
 
-#define TRIE_MAX_NODES    LLMQ_TRIE_MAX_NODES
-#define TRIE_MAX_CHILDREN LLMQ_TRIE_MAX_CHILDREN
-#define TRIE_MAX_SEGMENT  LLMQ_TRIE_MAX_SEGMENT
-#define BITS_PER_SLOT     64                                 // Bits per u64 bitmap slot
-#define TRIE_FD_SLOTS     (LLMQ_MAX_CLIENTS / BITS_PER_SLOT) // Scales with max clients
+#define TRIE_INITIAL_NODES LLMQ_TRIE_INITIAL_NODES
+#define TRIE_MAX_SEGMENT   LLMQ_TRIE_MAX_SEGMENT
+#define BITS_PER_SLOT      64                                  // Bits per u64 bitmap slot
+#define TRIE_FD_SLOTS      (LLMQ_MAX_CLIENTS / BITS_PER_SLOT) // Scales with max clients
 
-// Hash table size for child lookup (power of 2, >= TRIE_MAX_CHILDREN)
-#define TRIE_CHILD_HASH_SIZE 64
+// Hash table size for child lookup (power of 2)
+// 512 supports up to ~350 children per node at <70% load factor
+#define TRIE_CHILD_HASH_SIZE 512
 #define TRIE_CHILD_HASH_MASK (TRIE_CHILD_HASH_SIZE - 1)
 
 // =============================================================================
@@ -45,7 +47,7 @@ INLINE u32 trie_hash_segment(const u8 *seg, u8 len) {
 
 struct trie_node {
     // Subscriber tracking (fd bitmap + generation for slot reuse detection)
-    u64 fd_bitmap[TRIE_FD_SLOTS];                    // 1024 bits for slot_idx
+    u64 fd_bitmap[TRIE_FD_SLOTS];                    // Bitmap for slot_idx
     u8 fd_gen[TRIE_FD_SLOTS * BITS_PER_SLOT];        // Generation when subscribed
     u32 sub_count;                                   // Active subscriber count
 
@@ -53,9 +55,11 @@ struct trie_node {
     u32 parent;                             // Parent node index
     u32 plus_child;                         // Direct '+' wildcard child (0 = none)
     u32 hash_child;                         // Direct '#' wildcard child (0 = none)
-    u32 child_hash[TRIE_CHILD_HASH_SIZE];   // Hash table: segment hash → child_idx (0 = empty)
-    u32 children[TRIE_MAX_CHILDREN];        // Linear array for iteration
-    u16 child_count;
+    u32 child_hash[TRIE_CHILD_HASH_SIZE];   // Hash table: segment hash -> child_idx (0 = empty)
+    u16 child_count;                        // Number of children (for diagnostics)
+
+    // Freelist linkage (only valid when node is free)
+    u32 next_free;
 
     // Segment name
     u8 name[TRIE_MAX_SEGMENT];
@@ -67,29 +71,84 @@ struct trie_node {
 };
 
 // =============================================================================
-// Trie Manager
+// Trie Manager (mmap'd node pool, grows via mremap)
 // =============================================================================
 
 struct topic_trie {
-    struct trie_node nodes[TRIE_MAX_NODES];
-    u32 free_head;  // Freelist head
-    u32 node_count; // Allocated nodes
+    struct trie_node *nodes;  // mmap'd node pool
+    u32 capacity;             // Current pool capacity
+    u32 free_head;            // Freelist head (0 = empty, node 0 is root)
+    u32 node_count;           // Allocated nodes
+    usize mmap_sz;            // Current mmap size (for mremap/munmap)
 };
 
 // =============================================================================
-// Initialization
+// Initialization (mmap-backed)
 // =============================================================================
 
-INLINE void trie_init(struct topic_trie *t) {
-    memset(t, 0, sizeof(*t));
+INLINE i32 trie_init(struct topic_trie *t) {
+    u32 initial = TRIE_INITIAL_NODES;
+    usize sz    = (usize)initial * sizeof(struct trie_node);
 
-    // Initialize freelist (skip node 0 - it's the root)
-    for (u32 i = 1; i < TRIE_MAX_NODES - 1; i++) {
-        t->nodes[i].children[0] = i + 1;
+    t->nodes = (struct trie_node *)sys_mmap(NULL, sz, PROT_READ | PROT_WRITE,
+                                            MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (t->nodes == MAP_FAILED) {
+        return -ENOMEM;
     }
-    t->nodes[TRIE_MAX_NODES - 1].children[0] = 0; // End of list
-    t->free_head                             = 1;
-    t->node_count                            = 1; // Root is always allocated
+
+    // mmap with MAP_ANON zeros all memory — root node (index 0) is already zeroed
+    t->capacity   = initial;
+    t->mmap_sz    = sz;
+    t->node_count = 1; // Root always allocated
+
+    // Initialize freelist (skip node 0 — it's the root)
+    for (u32 i = 1; i < initial - 1; i++) {
+        t->nodes[i].next_free = i + 1;
+    }
+    t->nodes[initial - 1].next_free = 0; // End of list
+    t->free_head                    = 1;
+
+    return 0;
+}
+
+// =============================================================================
+// Cleanup
+// =============================================================================
+
+INLINE void trie_cleanup(struct topic_trie *t) {
+    if (t->nodes) {
+        sys_munmap(t->nodes, t->mmap_sz);
+        t->nodes = NULL;
+    }
+}
+
+// =============================================================================
+// Growth (mremap to double capacity)
+// =============================================================================
+
+INLINE i32 trie_grow(struct topic_trie *t) {
+    u32 new_cap  = t->capacity * 2;
+    usize new_sz = (usize)new_cap * sizeof(struct trie_node);
+
+    void *new_ptr = sys_mremap(t->nodes, t->mmap_sz, new_sz, MREMAP_MAYMOVE);
+    if (new_ptr == MAP_FAILED) {
+        return -ENOMEM;
+    }
+
+    t->nodes = (struct trie_node *)new_ptr;
+
+    // New pages from mremap of anonymous mappings are zero-filled.
+    // Chain new nodes into freelist (prepend to existing free list).
+    for (u32 i = t->capacity; i < new_cap - 1; i++) {
+        t->nodes[i].next_free = i + 1;
+    }
+    t->nodes[new_cap - 1].next_free = t->free_head; // Link tail to old freelist
+    t->free_head                    = t->capacity;   // New nodes become freelist head
+
+    t->capacity = new_cap;
+    t->mmap_sz  = new_sz;
+
+    return 0;
 }
 
 // =============================================================================
@@ -98,11 +157,14 @@ INLINE void trie_init(struct topic_trie *t) {
 
 INLINE u32 trie_alloc(struct topic_trie *t) {
     if (t->free_head == 0) {
-        return 0; // Pool exhausted
+        // Pool exhausted — grow via mremap
+        if (trie_grow(t) < 0) {
+            return 0; // Can't grow
+        }
     }
 
     u32 idx      = t->free_head;
-    t->free_head = t->nodes[idx].children[0];
+    t->free_head = t->nodes[idx].next_free;
     t->node_count++;
 
     memset(&t->nodes[idx], 0, sizeof(struct trie_node));
@@ -112,8 +174,8 @@ INLINE u32 trie_alloc(struct topic_trie *t) {
 INLINE void trie_free(struct topic_trie *t, u32 idx) {
     if (idx == 0)
         return; // Don't free root
-    t->nodes[idx].children[0] = t->free_head;
-    t->free_head              = idx;
+    t->nodes[idx].next_free = t->free_head;
+    t->free_head            = idx;
     t->node_count--;
 }
 
@@ -174,20 +236,14 @@ INLINE bool trie_add_child(struct topic_trie *t, u32 parent_idx, u32 child_idx) 
     struct trie_node *parent = &t->nodes[parent_idx];
     struct trie_node *child  = &t->nodes[child_idx];
 
-    if (parent->child_count >= TRIE_MAX_CHILDREN) {
-        return false;
-    }
-
-    // Add to linear array (for iteration)
-    parent->children[parent->child_count++] = child_idx;
-    child->parent                           = parent_idx;
-
     // Add to hash table for O(1) lookup
     u32 hash = trie_hash_segment(child->name, child->name_len);
     if (!trie_hash_insert(parent, child_idx, hash)) {
-        parent->child_count--; // Rollback
-        return false;
+        return false; // Hash table full
     }
+
+    child->parent = parent_idx;
+    parent->child_count++;
 
     // Update direct wildcard pointers
     if (child->is_plus) {
@@ -310,8 +366,8 @@ INLINE void trie_remove_fd(struct topic_trie *t, u32 fd) {
     u32 slot = fd / BITS_PER_SLOT;
     u64 bit  = 1ULL << (fd % BITS_PER_SLOT);
 
-    // Scan all nodes
-    for (u32 i = 0; i < TRIE_MAX_NODES; i++) {
+    // Scan all nodes (including free — harmless since bitmaps are zeroed on alloc)
+    for (u32 i = 0; i < t->capacity; i++) {
         struct trie_node *node = &t->nodes[i];
         if (node->fd_bitmap[slot] & bit) {
             node->fd_bitmap[slot] &= ~bit;
@@ -394,7 +450,6 @@ INLINE void trie_match_collect(struct topic_trie *t, const u8 *topic, u16 len,
 static void trie_match_collect_recursive(struct topic_trie *t, u32 node_idx, const u8 *topic,
                                          u16 pos, u16 len, struct trie_match_result *result) {
     // Check for '#' wildcard child (matches all remaining)
-    // No branch hints - pattern is stable, let CPU predictor learn
     u32 hash_child = trie_find_hash(t, node_idx);
     if (hash_child != 0 && t->nodes[hash_child].sub_count > 0) {
         if (result->count < TRIE_MAX_MATCHES) {

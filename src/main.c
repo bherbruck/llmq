@@ -129,23 +129,24 @@ i32 broker_main(i32 argc, char **argv, char **envp) {
     // Calculate pool sizes
     u32 msg_pool_size       = cfg.limits_msg_pool_size;
     u16 egress_capacity     = cfg.client_egress_capacity;
+    u32 recv_pool_size      = cfg.limits_max_conns * FD_MULTIPLIER; // 2x: clients + stolen headroom
 
     // mmap client slots and fd mapping (max_fds = 2x clients for headroom)
     rc = broker_init(&b, cfg.limits_max_conns, cfg.limits_max_conns * FD_MULTIPLIER,
-                     cfg.client_max_inflight, LLMQ_RECV_BUF_SIZE, msg_pool_size,
-                     egress_capacity);
+                     cfg.client_max_inflight, LLMQ_RECV_BUF_SIZE, recv_pool_size,
+                     msg_pool_size, egress_capacity);
     if (rc < 0) {
         log_error("broker_init failed (mmap): %d", rc);
         return 1;
     }
     b.port = cfg.network_port;
 
-    // Calculate memory usage from pools
+    // Calculate memory usage from pools (recv_pool may be rounded up to power of 2)
     u64 client_mem    = (u64)cfg.limits_max_conns * sizeof(struct client_slot);
-    u64 recv_mem      = (u64)cfg.limits_max_conns * LLMQ_RECV_BUF_SIZE;
+    u64 recv_mem      = (u64)b.recv_pool.capacity * LLMQ_RECV_BUF_SIZE;
     u64 msg_mem       = (u64)msg_pool_size * sizeof(struct canonical_msg);
     u64 egress_mem    = (u64)cfg.limits_max_conns * egress_capacity * sizeof(struct egress_segment);
-    log_info("Memory: clients=%lu KB, recv=%lu MB, msg=%lu KB, egress=%lu KB",
+    log_info("Memory: clients=%lu KB, recv=%lu MB (growable), msg=%lu KB (growable), egress=%lu KB",
              client_mem / KB_DIVISOR, recv_mem / MB_DIVISOR, msg_mem / KB_DIVISOR,
              egress_mem / KB_DIVISOR);
 

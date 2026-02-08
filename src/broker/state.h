@@ -105,7 +105,8 @@ struct broker {
 // =============================================================================
 
 INLINE i32 broker_init(struct broker *b, u32 max_clients, u32 max_fds, u16 max_inflight,
-                       u32 recv_buf_size, u32 msg_pool_size, u16 egress_capacity) {
+                       u32 recv_buf_size, u32 recv_pool_size, u32 msg_pool_size,
+                       u16 egress_capacity) {
     if (egress_capacity == 0 || (egress_capacity & (egress_capacity - 1)) != 0) {
         return -1;
     }
@@ -142,8 +143,8 @@ INLINE i32 broker_init(struct broker *b, u32 max_clients, u32 max_fds, u16 max_i
 
     // Initialize buffer pools FIRST (before client slots need them)
 
-    // Recv pool: one buffer per potential active client
-    if (buf_pool_init(&b->recv_pool, max_clients, recv_buf_size) < 0) {
+    // Recv pool: sized for active clients + headroom for stolen buffers in-flight
+    if (buf_pool_init(&b->recv_pool, recv_pool_size, recv_buf_size) < 0) {
         sys_munmap(b->egress_flush_queue, egress_flush_size);
         sys_munmap(b->recv_retry_queue, recv_retry_size);
         return -1;
@@ -263,11 +264,25 @@ INLINE i32 broker_init(struct broker *b, u32 max_clients, u32 max_fds, u16 max_i
         b->fd_to_slot[i] = -1;
     }
 
-    // Initialize trie
-    trie_init(&b->trie);
+    // Initialize trie (mmap'd, grows via mremap)
+    if (trie_init(&b->trie) < 0) {
+        sys_munmap(b->fd_to_slot, fd_map_size);
+        sys_munmap(b->egress_arena, egress_arena_size);
+        sys_munmap(b->inflight_hot_arena, hot_arena_size);
+        sys_munmap(b->inflight_cold_arena, cold_arena_size);
+        sys_munmap(b->inflight_hash_arena, hash_arena_size);
+        sys_munmap(b->pending_arena, pend_arena_size);
+        sys_munmap(b->clients, clients_size);
+        sys_munmap(b->egress_flush_queue, egress_flush_size);
+        sys_munmap(b->recv_retry_queue, recv_retry_size);
+        buf_pool_cleanup(&b->recv_pool);
+        msg_pool_cleanup(&b->msg_pool);
+        return -1;
+    }
 
     // Initialize client_id hash table (sized for 2x max_clients for low load factor)
     if (hashmap_init(&b->client_map, max_clients * 2) < 0) {
+        trie_cleanup(&b->trie);
         sys_munmap(b->fd_to_slot, fd_map_size);
         sys_munmap(b->egress_arena, egress_arena_size);
         sys_munmap(b->inflight_hot_arena, hot_arena_size);
@@ -335,6 +350,7 @@ INLINE void broker_cleanup(struct broker *b) {
     }
     buf_pool_cleanup(&b->recv_pool);
     msg_pool_cleanup(&b->msg_pool);
+    trie_cleanup(&b->trie);
     hashmap_cleanup(&b->client_map);
 }
 

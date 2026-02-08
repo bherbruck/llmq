@@ -123,10 +123,48 @@ INLINE struct canonical_msg *msg_pool_get(struct msg_pool *p, u32 idx) {
     return &p->msgs[idx];
 }
 
+// Grow message pool capacity by doubling via mremap
+// Safe because callers store indices (u32), never long-lived pointers
+// Returns 0 on success, -1 on failure (caller should handle gracefully)
+INLINE i32 msg_pool_grow(struct msg_pool *p) {
+    u32 old_cap = p->capacity;
+    u32 new_cap = old_cap * 2;
+
+    // Grow free stack first (smaller, less likely to fail)
+    usize old_stack_sz = (usize)old_cap * sizeof(u32);
+    usize new_stack_sz = (usize)new_cap * sizeof(u32);
+    void *new_stack    = sys_mremap(p->free_stack, old_stack_sz, new_stack_sz, MREMAP_MAYMOVE);
+    if (IS_ERR(new_stack)) {
+        return -1;
+    }
+    p->free_stack = (u32 *)new_stack;
+
+    // Grow msgs array
+    usize old_msgs_sz = (usize)old_cap * sizeof(struct canonical_msg);
+    usize new_msgs_sz = (usize)new_cap * sizeof(struct canonical_msg);
+    void *new_msgs    = sys_mremap(p->msgs, old_msgs_sz, new_msgs_sz, MREMAP_MAYMOVE);
+    if (IS_ERR(new_msgs)) {
+        // Stack already grew but msgs didn't - harmless, capacity unchanged
+        return -1;
+    }
+    p->msgs = (struct canonical_msg *)new_msgs;
+
+    // Push new indices onto free stack (reverse order for cache locality)
+    u32 added = new_cap - old_cap;
+    for (u32 i = 0; i < added; i++) {
+        p->free_stack[p->free_count++] = new_cap - 1 - i;
+    }
+
+    p->capacity = new_cap;
+    return 0;
+}
+
 // Allocate a message slot, returns index or MSG_POOL_INVALID
 INLINE u32 msg_pool_alloc(struct msg_pool *p) {
     if (unlikely(p->free_count == 0)) {
-        return MSG_POOL_INVALID;
+        if (msg_pool_grow(p) < 0) {
+            return MSG_POOL_INVALID;
+        }
     }
     p->free_count--;
 
