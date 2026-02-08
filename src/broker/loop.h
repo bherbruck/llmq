@@ -366,6 +366,8 @@ INLINE u8 egress_flush(struct broker *b, struct client_slot *c, u32 slot_idx) {
     u8 batch   = 0;   // Total segments in batch
     u8 pub_idx = 0;   // Index into scratch arrays (PUBLISH only)
     u8 iov_cnt = 0;
+    u32 total_wire_len = 0; // Running total for fast-path CQE completion
+    u8 has_qos0_refs = 0;   // Track if any QoS 0 PUBLISH needs ref release
 
     for (u8 i = 0; i < EGRESS_BATCH_MAX && (u16)i < c->egress_count; i++) {
         struct egress_segment *seg = &c->egress[(c->egress_head + i) & c->egress_mask];
@@ -378,8 +380,10 @@ INLINE u8 egress_flush(struct broker *b, struct client_slot *c, u32 slot_idx) {
             if (seg->ctrl_len == 0 || seg->cursor >= seg->ctrl_len) break;
             // Only first segment can have non-zero cursor (partial resume)
             if (batch > 0 && seg->cursor > 0) break;
+            u32 seg_wire = seg->ctrl_len - seg->cursor;
             c->egress_iov[iov_cnt].iov_base = seg->ctrl + seg->cursor;
-            c->egress_iov[iov_cnt].iov_len  = seg->ctrl_len - seg->cursor;
+            c->egress_iov[iov_cnt].iov_len  = seg_wire;
+            total_wire_len += seg_wire;
             iov_cnt++;
             batch++;
             continue;
@@ -398,6 +402,7 @@ INLINE u8 egress_flush(struct broker *b, struct client_slot *c, u32 slot_idx) {
 
         // Only first segment can have non-zero cursor (partial resume)
         if (batch > 0 && seg->cursor > 0) break;
+        total_wire_len += wire_len - seg->cursor;
 
         // QoS 1/2: allocate inflight at send time (deferred from fan-out).
         // packet_id==0 means first send; packet_id>0 means retransmit.
@@ -447,6 +452,7 @@ INLINE u8 egress_flush(struct broker *b, struct client_slot *c, u32 slot_idx) {
         } else {
             c->egress_iov[iov_cnt].iov_base = NULL;
             c->egress_iov[iov_cnt].iov_len  = 0;
+            if (seg->msg_idx != MSG_POOL_INVALID) has_qos0_refs = 1;
         }
         iov_cnt++;
         c->egress_iov[iov_cnt].iov_base = msgbuf + msg->payload_off;
@@ -472,8 +478,10 @@ INLINE u8 egress_flush(struct broker *b, struct client_slot *c, u32 slot_idx) {
     ring_prep_writev(sqe, c->fd, c->egress_iov, iov_cnt, 0);
     sqe->user_data = make_user_data(OP_EGRESS, (u32)c->fd,
                                     MAKE_EGRESS_CTX(slot_idx, c->generation));
-    c->egress_inflight    = 1;
-    c->egress_batch_count = batch;
+    c->egress_inflight        = 1;
+    c->egress_batch_count     = batch;
+    c->egress_batch_wire_len  = total_wire_len;
+    c->egress_batch_qos0_refs = has_qos0_refs;
     return EGRESS_FLUSH_SUBMITTED;
 }
 
@@ -498,23 +506,44 @@ INLINE void handle_egress_cqe(struct broker *b, struct io_uring_cqe *cqe) {
 
     if (likely(cqe->res > 0)) {
         b->bytes_sent += (u64)cqe->res;
-        u32 bytes_left = (u32)cqe->res;
 
-        // Walk batch segments, completing those fully sent
-        for (u8 i = 0; i < batch && c->egress_count > 0 && bytes_left > 0; i++) {
-            struct egress_segment *seg =
-                egress_head_seg(c->egress, c->egress_head, c->egress_mask);
-            u32 wire_len = (seg->kind == SEG_CTRL)
-                               ? (u32)seg->ctrl_len
-                               : egress_seg_load_wire_len(seg);
-            u32 seg_remaining = wire_len - seg->cursor;
-
-            if (bytes_left >= seg_remaining) {
-                bytes_left -= seg_remaining;
-                egress_complete_head(b, c, seg);
+        // Fast path: entire batch sent in one shot (common case)
+        if (likely((u32)cqe->res == c->egress_batch_wire_len)) {
+            if (likely(!c->egress_batch_qos0_refs)) {
+                // Ultra-fast: no QoS 0 refs — bulk pop without touching segments
+                if (batch <= c->egress_count) {
+                    c->egress_head = (c->egress_head + batch) & c->egress_mask;
+                    c->egress_count -= batch;
+                } else {
+                    c->egress_head = (c->egress_head + c->egress_count) & c->egress_mask;
+                    c->egress_count = 0;
+                }
             } else {
-                seg->cursor += bytes_left;
-                bytes_left = 0;
+                // QoS 0 refs present — iterate to release
+                for (u8 i = 0; i < batch && c->egress_count > 0; i++) {
+                    struct egress_segment *seg =
+                        egress_head_seg(c->egress, c->egress_head, c->egress_mask);
+                    egress_complete_head(b, c, seg);
+                }
+            }
+        } else {
+            // Slow path: partial send — walk segments to find boundary
+            u32 bytes_left = (u32)cqe->res;
+            for (u8 i = 0; i < batch && c->egress_count > 0 && bytes_left > 0; i++) {
+                struct egress_segment *seg =
+                    egress_head_seg(c->egress, c->egress_head, c->egress_mask);
+                u32 wire_len = (seg->kind == SEG_CTRL)
+                                   ? (u32)seg->ctrl_len
+                                   : egress_seg_load_wire_len(seg);
+                u32 seg_remaining = wire_len - seg->cursor;
+
+                if (bytes_left >= seg_remaining) {
+                    bytes_left -= seg_remaining;
+                    egress_complete_head(b, c, seg);
+                } else {
+                    seg->cursor += bytes_left;
+                    bytes_left = 0;
+                }
             }
         }
     } else if (cqe->res == -EAGAIN || cqe->res == -EINTR) {

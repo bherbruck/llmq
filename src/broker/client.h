@@ -160,7 +160,8 @@ struct client_slot {
     u8 egress_inflight;              // 1 if a writev is in-flight for this client
     u8 egress_retry_queued;          // 1 if queued in global egress flush retry queue
     u8 egress_batch_count;           // Segments in current batched writev (1..EGRESS_BATCH_MAX)
-    u8 _pad_egress;
+    u8 egress_batch_qos0_refs;       // 1 if batch has QoS 0 PUBLISH needing ref release
+    u32 egress_batch_wire_len;       // Total wire bytes for current batch (fast-path CQE)
 
     // Scratch area for materializing batched iov at submit time.
     // Valid only while egress_inflight == 1 (one writev per client).
@@ -232,9 +233,11 @@ INLINE void client_init(struct client_slot *c, i32 fd, u32 recv_buf_idx, u16 max
     // Egress queue state
     c->egress_head      = 0;
     c->egress_count     = 0;
-    c->egress_inflight     = 0;
-    c->egress_retry_queued = 0;
-    c->egress_batch_count  = 0;
+    c->egress_inflight        = 0;
+    c->egress_retry_queued    = 0;
+    c->egress_batch_count     = 0;
+    c->egress_batch_qos0_refs = 0;
+    c->egress_batch_wire_len  = 0;
     // egress, egress_capacity, egress_mask set by broker_init wiring
 }
 
@@ -252,9 +255,9 @@ INLINE u8 *client_recv_buf(struct client_slot *c, struct buf_pool *recv_pool) {
 // Returns RESP_SLOTS if all slots are busy (caller should fall back to sync)
 INLINE u8 client_get_resp_slot(struct client_slot *c) {
     for (u8 i = 0; i < RESP_SLOTS; i++) {
-        u8 slot = (c->resp_slot + i) % RESP_SLOTS;
+        u8 slot = (c->resp_slot + i) & (RESP_SLOTS - 1);
         if (!(c->resp_in_flight & (1 << slot))) {
-            c->resp_slot = (slot + 1) % RESP_SLOTS;
+            c->resp_slot = (slot + 1) & (RESP_SLOTS - 1);
             return slot;
         }
     }
@@ -355,7 +358,7 @@ INLINE struct pending_msg *client_pending_push(struct client_slot *c) {
         return NULL;
     }
     struct pending_msg *msg = &c->pending[c->pending_tail];
-    c->pending_tail         = (c->pending_tail + 1) % LLMQ_MAX_PENDING_MSGS;
+    c->pending_tail         = (c->pending_tail + 1) & (LLMQ_MAX_PENDING_MSGS - 1);
     c->pending_count++;
     return msg;
 }
@@ -369,7 +372,7 @@ INLINE struct pending_msg *client_pending_peek(struct client_slot *c) {
 INLINE void client_pending_pop(struct client_slot *c) {
     if (c->pending_count == 0)
         return;
-    c->pending_head = (c->pending_head + 1) % LLMQ_MAX_PENDING_MSGS;
+    c->pending_head = (c->pending_head + 1) & (LLMQ_MAX_PENDING_MSGS - 1);
     c->pending_count--;
 }
 

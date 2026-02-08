@@ -155,6 +155,13 @@ INLINE void process_publish_matches(struct broker *b, struct publish_ctx *pctx,
             while (bits) {
                 u32 bit_idx  = (u32)__builtin_ctzll(bits);
                 u32 slot_idx = slot * BITS_PER_SLOT + bit_idx;
+                bits &= bits - 1; // Clear lowest bit
+
+                // Prefetch next subscriber's client_slot while processing current
+                if (bits) {
+                    u32 next_idx = slot * BITS_PER_SLOT + (u32)__builtin_ctzll(bits);
+                    __builtin_prefetch(&b->clients[next_idx], 1, 1);
+                }
 
                 // Mark as sent (avoid duplicates from multiple matching wildcards)
                 pctx->sent_bitmap[slot] |= (1ULL << bit_idx);
@@ -166,8 +173,6 @@ INLINE void process_publish_matches(struct broker *b, struct publish_ctx *pctx,
                 if (likely(c->state == CLIENT_ACTIVE && c->generation == node->fd_gen[slot_idx])) {
                     forward_publish_zc(b, slot_idx, c, pctx, msg, pub_qos);
                 }
-
-                bits &= bits - 1; // Clear lowest bit
             }
         }
     }

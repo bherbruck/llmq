@@ -47,6 +47,7 @@ struct broker {
     u32 recv_retry_head;
     u32 recv_retry_tail;
     u32 recv_retry_capacity;
+    u32 recv_retry_mask;     // capacity - 1 for bitmask indexing
 
     // Per-client egress segment arena
     struct egress_segment *egress_arena;
@@ -57,6 +58,7 @@ struct broker {
     u32 egress_flush_head;
     u32 egress_flush_tail;
     u32 egress_flush_capacity;
+    u32 egress_flush_mask;   // capacity - 1 for bitmask indexing
 
     // fd → slot index mapping (mmap'd)
     i32 *fd_to_slot;
@@ -117,9 +119,10 @@ INLINE i32 broker_init(struct broker *b, u32 max_clients, u32 max_fds, u16 max_i
     b->active_count  = 0;
     b->dormant_count = 0;
 
-    // Initialize recv retry queue (sized to max_clients + 1 because circular buffer
-    // full detection wastes one slot: (tail+1)%cap == head)
-    b->recv_retry_capacity = max_clients + 1;
+    // Initialize recv retry queue (power-of-2 sized for bitmask indexing)
+    // Wastes one slot for full detection, so capacity must be > max_clients
+    b->recv_retry_capacity = buf_pool_next_pow2(max_clients + 1);
+    b->recv_retry_mask     = b->recv_retry_capacity - 1;
     b->recv_retry_head     = 0;
     b->recv_retry_tail     = 0;
     usize recv_retry_size  = (usize)b->recv_retry_capacity * sizeof(u32);
@@ -129,8 +132,9 @@ INLINE i32 broker_init(struct broker *b, u32 max_clients, u32 max_fds, u16 max_i
         return -1;
     }
 
-    // Initialize egress flush queue (sized to max_clients + 1)
-    b->egress_flush_capacity = max_clients + 1;
+    // Initialize egress flush queue (power-of-2 sized for bitmask indexing)
+    b->egress_flush_capacity = buf_pool_next_pow2(max_clients + 1);
+    b->egress_flush_mask     = b->egress_flush_capacity - 1;
     b->egress_flush_head     = 0;
     b->egress_flush_tail     = 0;
     usize egress_flush_size  = (usize)b->egress_flush_capacity * sizeof(u32);
@@ -365,7 +369,7 @@ INLINE bool recv_retry_empty(struct broker *b) {
 
 // Check if retry queue is full
 INLINE bool recv_retry_full(struct broker *b) {
-    u32 next = (b->recv_retry_tail + 1) % b->recv_retry_capacity;
+    u32 next = (b->recv_retry_tail + 1) & b->recv_retry_mask;
     return next == b->recv_retry_head;
 }
 
@@ -375,7 +379,7 @@ INLINE void recv_retry_enqueue(struct broker *b, u32 slot_idx) {
         return; // Queue full - should never happen if sized to max_clients
     }
     b->recv_retry_queue[b->recv_retry_tail] = slot_idx;
-    b->recv_retry_tail = (b->recv_retry_tail + 1) % b->recv_retry_capacity;
+    b->recv_retry_tail = (b->recv_retry_tail + 1) & b->recv_retry_mask;
 }
 
 // Dequeue slot_idx for recv retry, returns max_clients if empty
@@ -384,7 +388,7 @@ INLINE u32 recv_retry_dequeue(struct broker *b) {
         return b->max_clients; // Sentinel: invalid slot
     }
     u32 slot_idx       = b->recv_retry_queue[b->recv_retry_head];
-    b->recv_retry_head = (b->recv_retry_head + 1) % b->recv_retry_capacity;
+    b->recv_retry_head = (b->recv_retry_head + 1) & b->recv_retry_mask;
     return slot_idx;
 }
 
@@ -402,7 +406,7 @@ INLINE bool egress_flush_empty(struct broker *b) {
 }
 
 INLINE bool egress_flush_full(struct broker *b) {
-    u32 next = (b->egress_flush_tail + 1) % b->egress_flush_capacity;
+    u32 next = (b->egress_flush_tail + 1) & b->egress_flush_mask;
     return next == b->egress_flush_head;
 }
 
@@ -421,7 +425,7 @@ INLINE void egress_flush_enqueue(struct broker *b, u32 slot_idx) {
     }
     b->egress_flush_queue[b->egress_flush_tail] = MAKE_EGRESS_CTX(slot_idx, c->generation);
     c->egress_retry_queued = 1;
-    b->egress_flush_tail = (b->egress_flush_tail + 1) % b->egress_flush_capacity;
+    b->egress_flush_tail = (b->egress_flush_tail + 1) & b->egress_flush_mask;
 }
 
 INLINE u32 egress_flush_dequeue(struct broker *b) {
@@ -429,7 +433,7 @@ INLINE u32 egress_flush_dequeue(struct broker *b) {
         return MAKE_EGRESS_CTX(b->max_clients, 0); // Sentinel: invalid slot
     }
     u32 ctx                = b->egress_flush_queue[b->egress_flush_head];
-    b->egress_flush_head   = (b->egress_flush_head + 1) % b->egress_flush_capacity;
+    b->egress_flush_head   = (b->egress_flush_head + 1) & b->egress_flush_mask;
     u32 slot_idx = EGRESS_CTX_SLOT(ctx);
     if (slot_idx < b->max_clients) {
         b->clients[slot_idx].egress_retry_queued = 0;
