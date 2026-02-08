@@ -133,7 +133,7 @@ INLINE i32 fsm_sub_start_delivery(struct broker *b, struct client_slot *sub,
         seg->slot_gen  = sub->generation;
         seg->ctrl_len  = 0;
         seg->cursor    = 0;
-        if (msg) egress_seg_store_wire_len(seg, egress_publish_wire_len(msg, 0));
+        if (msg) seg->wire_len = msg->wire_len_qos0;
         sub->egress_count++;
         if (egress_flush(b, sub, slot_idx) == EGRESS_FLUSH_SQ_FULL) {
             egress_flush_enqueue(b, slot_idx);
@@ -161,7 +161,7 @@ INLINE i32 fsm_sub_start_delivery(struct broker *b, struct client_slot *sub,
     seg->slot_gen  = sub->generation;
     seg->ctrl_len  = 0;
     seg->cursor    = 0;
-    if (msg) egress_seg_store_wire_len(seg, egress_publish_wire_len(msg, sub_qos));
+    if (msg) seg->wire_len = sub_qos > 0 ? msg->wire_len_qos12 : msg->wire_len_qos0;
     sub->egress_count++;
     if (egress_flush(b, sub, slot_idx) == EGRESS_FLUSH_SQ_FULL) {
         egress_flush_enqueue(b, slot_idx);
@@ -301,7 +301,7 @@ INLINE void fsm_sub_timeout(struct broker *b, struct client_slot *sub,
     seg->slot_gen  = sub->generation;
     seg->ctrl_len  = 0;
     seg->cursor    = 0;
-    if (msg) egress_seg_store_wire_len(seg, egress_publish_wire_len(msg, cold->qos));
+    if (msg) seg->wire_len = cold->qos > 0 ? msg->wire_len_qos12 : msg->wire_len_qos0;
     sub->egress_count++;
 
     if (egress_flush(b, sub, client_slot_idx) == EGRESS_FLUSH_SQ_FULL) {

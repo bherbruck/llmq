@@ -37,7 +37,10 @@ INLINE u32 atomic_dec(atomic_u32 *a) {
 // =============================================================================
 
 // Canonical message: metadata pointing into stolen recv buffer
-// The actual data lives in the stolen buffer, not copied here
+// The actual data lives in the stolen buffer, not copied here.
+// Padded to 32 bytes (power-of-2) for cache-line alignment: exactly 2 per line,
+// no straddling on random access. Extra space holds pre-computed wire lengths
+// to eliminate VBI encoding from the per-subscriber hot path.
 struct canonical_msg {
     u32 buf_idx;          // Index into recv_pool (stolen buffer)
     u16 topic_off;        // Offset to topic string within buffer
@@ -49,9 +52,11 @@ struct canonical_msg {
     u8 dup;               // DUP flag
     u8 _pad;
     atomic_u32 ref_count; // Decremented per-subscriber completion
+    u32 wire_len_qos0;    // Pre-computed total wire length at QoS 0
+    u32 wire_len_qos12;   // Pre-computed total wire length at QoS 1/2
 };
 
-STATIC_ASSERT(sizeof(struct canonical_msg) == 24, "canonical_msg should be 24 bytes");
+STATIC_ASSERT(sizeof(struct canonical_msg) == 32, "canonical_msg should be 32 bytes");
 
 // =============================================================================
 // Message Pool (metadata pool, not buffer pool)

@@ -344,7 +344,7 @@ INLINE u8 egress_flush(struct broker *b, struct client_slot *c, u32 slot_idx) {
             continue;
         }
         if (seg->kind == SEG_PUBLISH) {
-            u32 wl = egress_seg_load_wire_len(seg);
+            u32 wl = seg->wire_len;
             if (wl == 0 || seg->cursor >= wl) { egress_discard_head(b, c, seg); continue; }
         } else if (seg->kind == SEG_CTRL) {
             if (seg->ctrl_len == 0 || seg->cursor >= seg->ctrl_len) {
@@ -397,7 +397,7 @@ INLINE u8 egress_flush(struct broker *b, struct client_slot *c, u32 slot_idx) {
         u8 *msgbuf = buf_pool_get(&b->recv_pool, msg->buf_idx);
         if (!msgbuf) break;
 
-        u32 wire_len = egress_seg_load_wire_len(seg);
+        u32 wire_len = seg->wire_len;
         if (wire_len == 0) break;
 
         // Only first segment can have non-zero cursor (partial resume)
@@ -534,7 +534,7 @@ INLINE void handle_egress_cqe(struct broker *b, struct io_uring_cqe *cqe) {
                     egress_head_seg(c->egress, c->egress_head, c->egress_mask);
                 u32 wire_len = (seg->kind == SEG_CTRL)
                                    ? (u32)seg->ctrl_len
-                                   : egress_seg_load_wire_len(seg);
+                                   : seg->wire_len;
                 u32 seg_remaining = wire_len - seg->cursor;
 
                 if (bytes_left >= seg_remaining) {

@@ -397,6 +397,8 @@ INLINE i32 process_mqtt_packet_ex(struct broker *b, struct client_slot *c, const
         msg->qos           = pub_pkt.qos;
         msg->retain        = pub_pkt.retain ? 1 : 0;
         msg->dup           = pub_pkt.dup ? 1 : 0;
+        msg->wire_len_qos0  = egress_publish_wire_len(msg, 0);
+        msg->wire_len_qos12 = egress_publish_wire_len(msg, 1);
 
         // Take base reference BEFORE fan-out to prevent premature freeing.
         // This ensures the buffer survives even if egress enqueue fails mid-iteration.

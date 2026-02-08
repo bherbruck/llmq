@@ -84,91 +84,74 @@ struct pending_msg {
 // =============================================================================
 // Client Slot - core structure, dynamically allocated buffers
 // =============================================================================
+//
+// Field order is cache-optimized: fan-out hot fields packed in the first cache
+// line (64 bytes) so per-subscriber iteration during PUBLISH fan-out touches
+// only 1 cache line instead of 3. Cold fields (identity, resp scratch, egress
+// scratch) are pushed to the end.
+
+#define RESP_SLOTS 16
+#define RESP_BUF_SIZE 16
+#define INFLIGHT_HASH_EMPTY 0xFFFF
 
 struct client_slot {
-    // === Identity (key for slot lookup) ===
-    u32 client_id_hash; // FNV-1a hash for fast comparison
-    u8 client_id[CLIENT_ID_MAX];
-    u8 client_id_len;
+    // ===== Cache line 0: Fan-out hot path (64 bytes) =====
+    // Ordered by access frequency during process_publish_matches → fsm_sub_start_delivery.
+    // Pointers first (8-byte aligned), then u32, u16, u8.
+    struct egress_segment *egress;        // Ring buffer of segments
+    struct inflight_hot *inflight_hot;    // Hot: packet_id, state, msg_idx (8B each)
+    i32 fd;                               // Socket fd (-1 when DORMANT/FREE)
+    u32 egress_batch_wire_len;            // Total wire bytes for current batch (fast-path CQE)
+    u16 egress_head;                      // Ring head index
+    u16 egress_count;                     // Current occupancy
+    u16 egress_capacity;                  // Ring size (power of 2)
+    u16 egress_mask;                      // capacity - 1
+    u16 inflight_count;                   // Active inflight messages
+    u16 max_inflight;                     // Runtime limit (must be power of 2)
+    u16 inflight_mask;                    // max_inflight - 1 for fast modulo via &
+    u16 inflight_free_hint;               // Hint for next free slot (O(1) alloc)
+    u16 next_packet_id;                   // Next packet ID to allocate (wraps at 65535)
+    u16 inflight_generation;              // Generation counter for packet_id cycling
+    u16 inflight_hash_mask;               // Hash table mask (2 * max_inflight - 1)
+    u8 state;                             // enum client_state
+    u8 generation;                        // Slot reuse generation (stale CQE detection)
+    u8 egress_inflight;                   // 1 if a writev is in-flight for this client
+    u8 egress_retry_queued;               // 1 if queued in global egress flush retry queue
+    u8 egress_batch_count;                // Segments in current batched writev
+    u8 egress_batch_qos0_refs;            // 1 if batch has QoS 0 PUBLISH needing ref release
+    u8 clean_session;                     // 1 = destroy on disconnect
+    u8 recv_pending;                      // 1 if recv is in-flight
+    u8 protocol_version;                  // 4 = MQTT 3.1.1, 5 = MQTT 5.0
+    u8 client_id_len;                     // Length of client_id
+    struct inflight_cold *inflight_cold;  // Cold: deadline, qos, etc (16B each)
+    // ===== End of cache line 0 (64 bytes) =====
 
-    // === State ===
-    u8 state;            // enum client_state
-    u8 clean_session;    // 1 = destroy on disconnect
-    u8 protocol_version; // 4 = MQTT 3.1.1, 5 = MQTT 5.0
-    u8 generation;       // Incremented each time slot is reused (for stale CQE detection)
-
-    // === Connection (valid when ACTIVE) ===
-    i32 fd;        // Socket fd (-1 when DORMANT/FREE)
-    u16 keepalive; // Keepalive interval (seconds)
-    u8 recv_pending; // 1 if recv is in-flight (kernel may write to buffer)
-    u8 _pad1;
-    u32 last_active; // Timestamp of last packet
-
-    // Receive buffer (dynamically allocated)
-    u32 recv_buf_idx;          // Index into recv buffer pool (BUF_POOL_INVALID if none)
-    u32 recv_start;            // Offset where unread data begins (allows no-copy advance)
-    u32 recv_len;              // Bytes of valid data starting at recv_start
-    u32 orphaned_recv_buf_idx; // Buffer from prev connection awaiting stale recv CQE
-
-    // Scratch area for immediate protocol responses
-    // Multiple slots to avoid race: async send may not complete before next response
-    #define RESP_SLOTS 16
-    #define RESP_BUF_SIZE 16
-    u8 resp_pkt_id[RESP_SLOTS][2];  // Big-endian packet_id for PUBACK/PUBREC/etc
-    u8 resp_buf[RESP_SLOTS][RESP_BUF_SIZE]; // Small responses (SUBACK, etc.)
-    struct iovec resp_iov[RESP_SLOTS][3]; // Scatter-gather for response
-    u8 resp_slot;                   // Next response slot hint (circular)
-    u16 resp_in_flight;             // Bitmask: 1 = slot has pending async send
-
-    // === Session (persists when DORMANT if clean_session=0) ===
-    // Subscriptions tracked in trie via slot index
-
-    // Pending messages for offline delivery (arena-allocated, not embedded)
-    struct pending_msg *pending;
+    // ===== Connection & identity =====
+    u16 *inflight_pkt_hash;               // packet_id hash → slot_idx
+    struct pending_msg *pending;          // Offline delivery queue (arena-allocated)
+    u32 client_id_hash;                   // FNV-1a hash for fast comparison
+    u32 last_active;                      // Timestamp of last packet
+    u32 recv_buf_idx;                     // Index into recv buffer pool
+    u32 recv_start;                       // Offset where unread data begins
+    u32 recv_len;                         // Bytes of valid data starting at recv_start
+    u32 orphaned_recv_buf_idx;            // Buffer from prev connection awaiting stale CQE
+    u16 keepalive;                        // Keepalive interval (seconds)
+    u16 resp_in_flight;                   // Bitmask: 1 = slot has pending async send
+    u8 resp_slot;                         // Next response slot hint (circular)
     u8 pending_head;
     u8 pending_tail;
     u8 pending_count;
-    u8 _pad2;
+    u8 client_id[CLIENT_ID_MAX];
 
-    // === QoS 1/2 Inflight tracking (hot/cold split for cache efficiency) ===
-    // Arrays are arena-allocated (not embedded) to keep client_slot compact for cache.
-    // At 1000 clients, embedded 68KB structs = 68MB working set (exceeds L3).
-    // With pointers, client_slot is ~1.2KB → 1000 clients = 1.2MB (fits in L3).
-    u16 next_packet_id;                               // Next packet ID to allocate (wraps at 65535)
-    u16 inflight_count;                               // Active inflight messages
-    u16 max_inflight;                                 // Runtime limit for this client (must be power of 2)
-    u16 inflight_mask;                                // max_inflight - 1 for fast modulo via &
-    u16 inflight_free_hint;                           // Hint for next free slot (O(1) alloc)
-    u16 inflight_generation;                          // Generation counter for packet_id cycling
-    u16 inflight_hash_mask;                           // Hash table mask (2 * max_inflight - 1)
-    u16 _pad3;
-    struct inflight_hot *inflight_hot;                // Hot: packet_id, state, msg_idx (8B each)
-    struct inflight_cold *inflight_cold;              // Cold: deadline, qos, etc (24B each)
+    // ===== Response scratch (cold, only on protocol responses) =====
+    u8 resp_pkt_id[RESP_SLOTS][2];        // Big-endian packet_id for PUBACK/PUBREC/etc
+    u8 resp_buf[RESP_SLOTS][RESP_BUF_SIZE]; // Small responses (SUBACK, etc.)
+    struct iovec resp_iov[RESP_SLOTS][3]; // Scatter-gather for response
 
-    // Packet ID hash table for O(1) lookup (packet_id → inflight slot)
-    // Size 2x max_inflight for good load factor with linear probing
-    #define INFLIGHT_HASH_EMPTY 0xFFFF
-    u16 *inflight_pkt_hash;                           // packet_id hash → slot_idx
-
-    // === Per-client egress queue (arena-allocated ring buffer) ===
-    struct egress_segment *egress;   // Ring buffer of segments
-    u16 egress_head;                 // Ring head index
-    u16 egress_count;                // Current occupancy
-    u16 egress_capacity;             // Ring size (power of 2)
-    u16 egress_mask;                 // capacity - 1
-
-    u8 egress_inflight;              // 1 if a writev is in-flight for this client
-    u8 egress_retry_queued;          // 1 if queued in global egress flush retry queue
-    u8 egress_batch_count;           // Segments in current batched writev (1..EGRESS_BATCH_MAX)
-    u8 egress_batch_qos0_refs;       // 1 if batch has QoS 0 PUBLISH needing ref release
-    u32 egress_batch_wire_len;       // Total wire bytes for current batch (fast-path CQE)
-
-    // Scratch area for materializing batched iov at submit time.
+    // ===== Egress scratch (coldest, only during flush) =====
     // Valid only while egress_inflight == 1 (one writev per client).
-    // Up to EGRESS_BATCH_MAX PUBLISH messages per writev to reduce SQE/CQE volume.
     u8 egress_headers[EGRESS_BATCH_MAX][7]; // Materialized PUBLISH fixed headers
     u8 egress_pkt_ids[EGRESS_BATCH_MAX][2]; // Big-endian packet_ids for iov
-    u8 _pad_scratch[2];
     struct iovec egress_iov[EGRESS_BATCH_MAX * 4]; // [hdr][topic][pktid][payload] × batch
 };
 
@@ -194,51 +177,51 @@ INLINE u32 fnv1a(const u8 *data, u32 len) {
 
 // Initialize a slot for a new client (call after allocating recv buffer)
 INLINE void client_init(struct client_slot *c, i32 fd, u32 recv_buf_idx, u16 max_inflight) {
+    // Cache line 0: fan-out hot path
     c->generation++;     // Increment to invalidate any stale CQEs from previous use
-    c->state            = CLIENT_ACTIVE;
-    c->fd               = fd;
-    c->client_id_len    = 0;
+    c->state                  = CLIENT_ACTIVE;
+    c->fd                     = fd;
+    c->egress_batch_wire_len  = 0;
+    c->egress_head            = 0;
+    c->egress_count           = 0;
+    // egress, egress_capacity, egress_mask set by broker_init wiring
+    c->inflight_count         = 0;
+    c->max_inflight           = max_inflight;
+    c->inflight_mask          = max_inflight - 1;
+    c->inflight_free_hint     = 0;
+    c->next_packet_id         = 1;
+    c->inflight_generation    = 0;
+    c->inflight_hash_mask     = 2 * max_inflight - 1;
+    c->egress_inflight        = 0;
+    c->egress_retry_queued    = 0;
+    c->egress_batch_count     = 0;
+    c->egress_batch_qos0_refs = 0;
+    c->clean_session          = 1;
+    c->recv_pending           = 0;
+    c->protocol_version       = 0; // 0 = awaiting CONNECT
+    c->client_id_len          = 0;
+
+    // Connection & identity
     c->client_id_hash   = 0;
-    c->clean_session    = 1;
-    c->protocol_version = 0; // 0 = awaiting CONNECT
-    c->keepalive        = 0;
-    c->recv_pending     = 0; // No recv in-flight yet
     c->last_active      = 0;
     c->recv_buf_idx     = recv_buf_idx;
     c->recv_start       = 0;
     c->recv_len         = 0;
     // Don't reset orphaned_recv_buf_idx - it may have a buffer waiting for stale CQE
+    c->keepalive        = 0;
+    c->resp_in_flight   = 0;
+    c->resp_slot        = 0;
     c->pending_head     = 0;
     c->pending_tail     = 0;
     c->pending_count    = 0;
-    c->resp_slot        = 0;
-    c->resp_in_flight   = 0; // Clear stale in-flight flags from previous connection
-    c->next_packet_id       = 1;
-    c->inflight_count       = 0;
-    c->max_inflight         = max_inflight;
-    c->inflight_mask        = max_inflight - 1;  // For fast modulo via &
-    c->inflight_free_hint   = 0;
-    c->inflight_generation  = 0;
-    c->inflight_hash_mask   = 2 * max_inflight - 1;
-    // Fast init: memset arrays to 0xFF (sets msg_idx to INVALID)
-    // Then fix up state field which needs to be 0 (INFLIGHT_FREE)
+
+    // Inflight arrays (arena-allocated)
     memset(c->inflight_hot, 0xFF, (usize)max_inflight * sizeof(struct inflight_hot));
     memset(c->inflight_cold, 0xFF, (usize)max_inflight * sizeof(struct inflight_cold));
     for (u16 i = 0; i < max_inflight; i++) {
         c->inflight_hot[i].state = INFLIGHT_FREE;
     }
-    // Initialize hash table with memset (INFLIGHT_HASH_EMPTY = 0xFFFF = all 1s)
     memset(c->inflight_pkt_hash, 0xFF, (usize)(2 * max_inflight) * sizeof(u16));
-
-    // Egress queue state
-    c->egress_head      = 0;
-    c->egress_count     = 0;
-    c->egress_inflight        = 0;
-    c->egress_retry_queued    = 0;
-    c->egress_batch_count     = 0;
-    c->egress_batch_qos0_refs = 0;
-    c->egress_batch_wire_len  = 0;
-    // egress, egress_capacity, egress_mask set by broker_init wiring
 }
 
 // Get receive buffer pointer (requires pool reference)

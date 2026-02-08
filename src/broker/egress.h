@@ -20,9 +20,13 @@
 // Max segments batched into a single writev SQE
 #define EGRESS_BATCH_MAX 64
 
-// Compound egress segment (24 bytes) - one per logical message
+// Compound egress segment (32 bytes) - one per logical message
+// Padded to power-of-2 for cache-line alignment (2 segments per cache line,
+// no straddling). Dedicated wire_len field replaces ctrl[0..3] encoding hack.
 struct egress_segment {
     u32 msg_idx;        // Canonical msg index (SEG_PUBLISH only, MSG_POOL_INVALID for CTRL)
+    u32 wire_len;       // SEG_PUBLISH: total wire length, SEG_CTRL: unused (use ctrl_len)
+    u32 cursor;         // Bytes already consumed (partial send resume)
     u16 packet_id;      // Per-subscriber packet ID (0 for QoS 0)
     u8 kind;            // SEG_PUBLISH or SEG_CTRL
     u8 qos;             // Subscriber's delivery QoS
@@ -31,10 +35,10 @@ struct egress_segment {
     u8 slot_gen;        // Client generation at enqueue time (stale protection)
     u8 ctrl_len;        // SEG_CTRL: actual byte count (0 for PUBLISH)
     u8 ctrl[8];         // SEG_CTRL: inline packet data (PUBREL etc)
-    u32 cursor;         // Bytes already consumed (partial send resume)
+    u8 _pad[4];         // Pad to 32 bytes
 };
 
-STATIC_ASSERT(sizeof(struct egress_segment) == 24, "egress_segment should be 24 bytes");
+STATIC_ASSERT(sizeof(struct egress_segment) == 32, "egress_segment should be 32 bytes");
 
 // Queue operations (power-of-two ring, bitmask indexing)
 INLINE bool egress_full(u16 count, u16 capacity) { return count >= capacity; }
@@ -65,18 +69,5 @@ INLINE u32 egress_publish_wire_len(struct canonical_msg *msg, u8 qos) {
     return total + remaining;
 }
 
-// For SEG_PUBLISH segments: store total wire length in ctrl[0..3]
-// (ctrl[] bytes are unused for PUBLISH, only meaningful for SEG_CTRL)
-INLINE void egress_seg_store_wire_len(struct egress_segment *seg, u32 len) {
-    seg->ctrl[0] = (u8)(len);
-    seg->ctrl[1] = (u8)(len >> 8);
-    seg->ctrl[2] = (u8)(len >> 16);
-    seg->ctrl[3] = (u8)(len >> 24);
-}
-
-INLINE u32 egress_seg_load_wire_len(struct egress_segment *seg) {
-    return (u32)seg->ctrl[0] | ((u32)seg->ctrl[1] << 8) |
-           ((u32)seg->ctrl[2] << 16) | ((u32)seg->ctrl[3] << 24);
-}
 
 #endif // BROKER_EGRESS_H

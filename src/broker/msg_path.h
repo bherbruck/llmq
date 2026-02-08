@@ -55,6 +55,8 @@ INLINE u32 msg_store(struct broker *b, u32 buf_idx,
     msg->qos                  = qos;
     msg->retain               = retain;
     msg->dup                  = dup;
+    msg->wire_len_qos0        = egress_publish_wire_len(msg, 0);
+    msg->wire_len_qos12       = egress_publish_wire_len(msg, 1);
 
     return msg_idx;
 }
